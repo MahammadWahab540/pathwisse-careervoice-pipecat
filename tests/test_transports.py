@@ -422,16 +422,16 @@ async def test_career_voice_evidence_evaluator_triggers_signal_on_pipeline_frame
         student_name="Candidate",
     )
 
-    assessment = {
-        "skillName": "React",
-        "evidenceFound": True,
-        "extractedLevel": "Advanced",
-        "confidenceScore": 88,
-        "evidenceStrength": "strong",
-        "evidenceSnippet": "Built analytics dashboard with React and PostgreSQL.",
-        "requiresFollowUp": False,
-        "followUpQuestion": None,
-    }
+    from bot import EvidenceAssessment
+    assessment = EvidenceAssessment(
+        skillName="React",
+        evidenceFound=True,
+        extractedLevel="Advanced",
+        confidenceScore=88,
+        evidenceStrength="strong",
+        evidenceSnippet="real-time analytics dashboard with React, Node.js, and PostgreSQL",
+        requiresFollowUp=False,
+    )
 
     with patch("bot.evaluate_student_evidence_llm", new_callable=AsyncMock, return_value=assessment):
         with patch("bot.notify_careervoice_signal", new_callable=AsyncMock) as mock_signal:
@@ -456,3 +456,4 @@ async def test_career_voice_evidence_evaluator_triggers_signal_on_pipeline_frame
             assert call_kwargs["evidence_strength"] == "strong"
             assert call_kwargs["extracted_level"] == "Advanced"
             assert call_kwargs["confidence_score"] == 88
+            await evaluator.shutdown()

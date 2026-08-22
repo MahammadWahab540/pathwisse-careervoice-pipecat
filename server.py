@@ -143,8 +143,10 @@ def readiness_check(response: Response):
             "gemini": gemini_ok,
             "anthropic": anthropic_ok,
             "openai": openai_ok,
+            "evidenceEvaluator": llm_ok,
             "serviceAuth": service_token_ok,
         },
+        "evidenceEvaluatorConfigured": llm_ok,
     }
 
 
