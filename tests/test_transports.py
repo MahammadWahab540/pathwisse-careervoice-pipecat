@@ -240,29 +240,30 @@ def test_auth_invalid_token_returns_401():
 
 def test_auth_valid_token_accepted():
     with patch.dict(os.environ, {"CAREERVOICE_SERVICE_TOKEN": "secret-token-xyz-123"}):
-        with patch(
-            "transports.factory.router.provision_session_with_failover",
-            new_callable=AsyncMock,
-            return_value=(
-                SessionProvisionResult(
-                    provider="daily",
-                    audit_id="test_auth_ok",
-                    room_url="https://daily.co/r",
-                    room_name="r",
-                    student_token="st",
-                    bot_token="bt",
-                    connection_url="https://daily.co/r",
+        with patch("server.run_careervoice_agent", new_callable=AsyncMock):
+            with patch(
+                "transports.factory.router.provision_session_with_failover",
+                new_callable=AsyncMock,
+                return_value=(
+                    SessionProvisionResult(
+                        provider="daily",
+                        audit_id="test_auth_ok",
+                        room_url="https://daily.co/r",
+                        room_name="r",
+                        student_token="st",
+                        bot_token="bt",
+                        connection_url="https://daily.co/r",
+                    ),
+                    MagicMock(),
                 ),
-                MagicMock(),
-            ),
-        ):
-            response = client.post(
-                "/api/voice/session",
-                json={"auditId": "test_auth_ok", "targetRole": "Engineer"},
-                headers={"Authorization": "Bearer secret-token-xyz-123"},
-            )
-            assert response.status_code == 200
-            assert response.json()["success"] is True
+            ):
+                response = client.post(
+                    "/api/voice/session",
+                    json={"auditId": "test_auth_ok", "targetRole": "Engineer"},
+                    headers={"Authorization": "Bearer secret-token-xyz-123"},
+                )
+                assert response.status_code == 200
+                assert response.json()["success"] is True
 
 
 # ==============================================================================
@@ -270,21 +271,22 @@ def test_auth_valid_token_accepted():
 # ==============================================================================
 def test_backward_compatibility_pre_provisioned_room():
     with patch.dict(os.environ, {"APP_ENV": "development", "CAREERVOICE_SERVICE_TOKEN": ""}):
-        response = client.post(
-            "/api/voice/session",
-            json={
-                "auditId": "legacy_audit",
-                "targetRole": "Frontend Developer",
-                "roomUrl": "https://careervoice.daily.co/legacy-room",
-                "token": "legacy-token-789",
-            },
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["provider"] == "daily"
-        assert data["roomUrl"] == "https://careervoice.daily.co/legacy-room"
-        assert data["token"] == "legacy-token-789"
-        assert data["connection"]["url"] == "https://careervoice.daily.co/legacy-room"
+        with patch("server.run_careervoice_agent", new_callable=AsyncMock):
+            response = client.post(
+                "/api/voice/session",
+                json={
+                    "auditId": "legacy_audit",
+                    "targetRole": "Frontend Developer",
+                    "roomUrl": "https://careervoice.daily.co/legacy-room",
+                    "token": "legacy-token-789",
+                },
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["provider"] == "daily"
+            assert data["roomUrl"] == "https://careervoice.daily.co/legacy-room"
+            assert data["token"] == "legacy-token-789"
+            assert data["connection"]["url"] == "https://careervoice.daily.co/legacy-room"
 
 
 # ==============================================================================
