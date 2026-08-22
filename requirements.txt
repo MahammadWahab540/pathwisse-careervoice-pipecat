@@ -2,7 +2,7 @@
 pipecat-ai[daily,livekit,deepgram,cartesia,google,anthropic,openai]>=0.0.45
 livekit>=0.17.0,<1.0.0
 livekit-api>=0.8.0,<1.0.0
-aiohttp==3.9.5
+aiohttp>=3.11.12,<4
 pydantic==2.7.4
 loguru==0.7.2
 python-dotenv==1.0.1
