@@ -1,99 +1,102 @@
-# Deploying Pipecat Voice Agent to AWS
+# Deploying Dual Transport Pipecat Voice Agent to AWS
 
-This guide explains how to deploy the **Pathwisse CareerVoice Pipecat Voice Agent** to AWS using **AWS ECR + AWS App Runner** (or **AWS ECS Fargate**).
-
----
-
-## Architecture Summary
-* **Service**: Python 3.11 + FastAPI + Pipecat WebRTC Voice Pipeline
-* **Port**: `8000`
-* **Health Check**: `GET /health`
-* **Session API**: `POST /api/voice/session`
+This guide covers deploying the **Pathwisse CareerVoice Dual Transport (Daily + LiveKit) Pipecat Voice Agent** to **AWS App Runner** (or AWS ECS Fargate) in `ap-south-1`.
 
 ---
 
-## Option 1: Fast 1-Click Deployment with AWS App Runner (Recommended)
+## 🏗️ Architecture & Security Model
 
-AWS App Runner manages container provisioning, load balancing, automatic SSL, and autoscaling automatically.
-
-### 1. Build and Push Docker Image to AWS ECR
-```bash
-# 1. Set your AWS Variables
-export AWS_REGION="ap-south-1" # or your preferred AWS region
-export AWS_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-export ECR_REPO="careervoice-pipecat"
-
-# 2. Create ECR Repository (if not created)
-aws ecr create-repository --repository-name $ECR_REPO --region $AWS_REGION
-
-# 3. Authenticate Docker with AWS ECR
-aws ecr get-login-password --region $AWS_REGION | docker login --username AWS --password-stdin $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com
-
-# 4. Build and Tag Docker Image
-cd services/pipecat-voice-agent
-docker build -t $ECR_REPO:latest .
-docker tag $ECR_REPO:latest $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:latest
-
-# 5. Push Image to ECR
-docker push $AWS_ACCOUNT_ID.dkr.ecr.$AWS_REGION.amazonaws.com/$ECR_REPO:latest
+```text
+GitHub Actions (OIDC) ──> Amazon ECR (Encrypted) ──> AWS App Runner
+                                                           │
+                                                           ├──> AWS Secrets Manager (Runtime Secrets)
+                                                           └──> Port 8000 (/health & /ready)
 ```
 
-### 2. Create AWS App Runner Service via AWS Console or CLI
-1. Open **AWS App Runner** in AWS Console $\rightarrow$ Click **Create Service**.
-2. Select **Container Registry** $\rightarrow$ Choose your ECR image (`careervoice-pipecat:latest`).
-3. Set Port to `8000`.
-4. Add the Environment Variables:
-   * `DAILY_API_KEY`: Your Daily.co API key.
-   * `DEEPGRAM_API_KEY`: Your Deepgram API key.
-   * `CARTESIA_API_KEY`: Your Cartesia API key.
-   * `GEMINI_API_KEY`: Google Gemini API key.
-   * `ANTHROPIC_API_KEY`: (Optional) Claude fallback key.
-   * `OPENAI_API_KEY`: (Optional) OpenAI fallback key.
-   * `CAREERVOICE_API_URL`: Your Node.js server URL (e.g. `https://careervoice.pathwisse.com`).
-5. Deploy. You will receive an HTTPS URL (e.g. `https://xxxx.ap-south-1.awsapprunner.com`).
+### 1. IAM Least-Privilege Roles
+* **`CareerVoiceAppRunnerECRAccessRole`**:
+  * Trusted by `build.apprunner.amazonaws.com`.
+  * Attached Policy: `arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess`.
+  * Purpose: Allows App Runner to pull Docker images from Amazon ECR.
+* **`CareerVoiceAppRunnerRuntimeRole`**:
+  * Trusted by `tasks.apprunner.amazonaws.com`.
+  * Inline Policy: `secretsmanager:GetSecretValue` on `arn:aws:secretsmanager:ap-south-1:<ACCOUNT_ID>:secret:careervoice/*`.
+  * Purpose: Securely injects API credentials into container at runtime without hardcoding in images or Git.
 
 ---
 
-## Option 2: Deploying to AWS ECS Fargate
+## 🔐 AWS Secrets Manager Checklist
 
-If your architecture uses AWS ECS with an Application Load Balancer:
+Ensure secrets exist under the `careervoice/` prefix in `ap-south-1`:
 
-```bash
-# Register ECS Task Definition
-aws ecs register-task-definition \
-  --cli-input-json file://deploy/aws-ecs-task-definition.json \
-  --region $AWS_REGION
-
-# Update or Create ECS Service
-aws ecs create-service \
-  --cluster careervoice-cluster \
-  --service-name pipecat-voice-agent \
-  --task-definition careervoice-pipecat-voice-agent \
-  --desired-count 2 \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[subnet-xxxx],securityGroups=[sg-xxxx],assignPublicIp=ENABLED}"
-```
+| Secret Name | Purpose |
+| :--- | :--- |
+| `careervoice/service-token` | Shared Bearer token for authenticating `POST /api/voice/session`. |
+| `careervoice/daily-api-key` | Daily.co WebRTC API key. |
+| `careervoice/livekit-url` | LiveKit cloud or self-hosted endpoint (`wss://...`). |
+| `careervoice/livekit-api-key` | LiveKit API Key. |
+| `careervoice/livekit-api-secret` | LiveKit API Secret. |
+| `careervoice/deepgram-api-key` | Deepgram Nova-2 Speech-to-Text API key. |
+| `careervoice/cartesia-api-key` | Cartesia Sonic Text-to-Speech API key. |
+| `careervoice/gemini-api-key` | Google Gemini API key (`GEMINI_MODEL=gemini-3.6-flash`). |
+| `careervoice/anthropic-api-key` | (Optional) Anthropic Claude fallback key. |
+| `careervoice/openai-api-key` | (Optional) OpenAI fallback key. |
 
 ---
 
-## Testing Your Deployed Pipecat Voice Server
+## 🔑 GitHub Actions OIDC Setup (Zero Permanent Secrets)
 
-```bash
-curl -X POST https://<YOUR_AWS_ENDPOINT>/api/voice/session \
-  -H "Content-Type: application/json" \
-  -d '{
-    "auditId": "audit_test_123",
-    "targetRole": "Full Stack Developer",
-    "studentName": "Alex"
-  }'
-```
+To enable GitHub Actions to deploy to AWS without long-lived `AWS_ACCESS_KEY_ID`:
 
-Response:
+1. In **AWS IAM** $\rightarrow$ **Identity Providers**, add `token.actions.githubusercontent.com` with Audience `sts.amazonaws.com`.
+2. Create an IAM Role (e.g. `CareerVoiceGitHubDeployRole`) with Trust Relationship:
 ```json
 {
-  "success": true,
-  "roomUrl": "https://careervoice.daily.co/audit-room-xyz",
-  "token": "d2948...",
-  "auditId": "audit_test_123"
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com"
+      },
+      "Action": "sts:AssumeRoleWithWebIdentity",
+      "Condition": {
+        "StringEquals": {
+          "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+        },
+        "StringLike": {
+          "token.actions.githubusercontent.com:sub": "repo:MahammadWahab540/pathwisse-careervoice-pipecat:*"
+        }
+      }
+    }
+  ]
 }
 ```
+3. Set GitHub Repository Secret:
+   * `AWS_ROLE_TO_ASSUME`: `arn:aws:iam::<ACCOUNT_ID>:role/CareerVoiceGitHubDeployRole`
+   * `AWS_REGION`: `ap-south-1`
+
+---
+
+## 🚀 1-Click Deployment Execution
+
+From AWS CloudShell or an authenticated local terminal:
+
+```bash
+cd deploy
+chmod +x deploy-apprunner.sh
+./deploy-apprunner.sh
+```
+
+On Windows PowerShell:
+```powershell
+cd deploy
+.\deploy-apprunner.ps1 -Region ap-south-1
+```
+
+The script automatically:
+1. Provisions/reuses `careervoice-pipecat` ECR repository.
+2. Builds and pushes the immutable Docker image tagged with Git SHA.
+3. Provisions the ECR Access Role and Secrets Runtime Role.
+4. Creates/updates App Runner with `RuntimeEnvironmentSecrets` mapping.
+5. Waits for `RUNNING` status and validates both `/health` (HTTP 200) and `/ready` (HTTP 200).

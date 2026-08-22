@@ -1,0 +1,68 @@
+name: Pull Request CI
+
+on:
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  validate:
+    name: Test, Validate Dependencies & Docker Container
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Python Compile Check
+        run: |
+          python -m compileall .
+
+      - name: Install Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Verify Dependency Consistency (pip check)
+        run: |
+          pip check
+
+      - name: Run Unit & Transport Tests
+        env:
+          PYTHONPATH: .
+          APP_ENV: development
+          GEMINI_MODEL: gemini-3.6-flash
+          VOICE_TRANSPORT_DEFAULT: daily
+          VOICE_TRANSPORT_FALLBACK: livekit
+        run: |
+          python -m pytest -v
+
+      - name: Build Production Docker Image
+        run: |
+          docker build -t careervoice-pipecat:ci .
+
+      - name: Verify Docker Container Startup, Health & Readiness Semantics
+        run: |
+          docker run -d --name careervoice-ci -p 8000:8000 careervoice-pipecat:ci
+          sleep 5
+
+          echo "Checking /health endpoint..."
+          curl --fail http://localhost:8000/health
+
+          echo "Checking /ready endpoint semantics (expecting 503 when credentials absent)..."
+          READY_CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:8000/ready)
+          if [ "$READY_CODE" != "503" ]; then
+            echo "ERROR: Expected HTTP 503 from /ready without credentials, got ${READY_CODE}"
+            docker logs careervoice-ci
+            docker rm -f careervoice-ci
+            exit 1
+          fi
+          echo "✓ /ready correctly returned HTTP 503 when dependencies unconfigured."
+
+          docker rm -f careervoice-ci
