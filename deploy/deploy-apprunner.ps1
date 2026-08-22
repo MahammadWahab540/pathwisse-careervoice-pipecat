@@ -74,18 +74,78 @@ if (-not $RuntimeRoleArn) {
 }
 Write-Host "App Runner Runtime Role ARN: $RuntimeRoleArn"
 
-Write-Host "=== 6. Setting up Autoscaling Configuration ===" -ForegroundColor Cyan
+Write-Host "=== 6. Dynamically Resolving AWS Secrets Manager ARNs ===" -ForegroundColor Cyan
+function Resolve-SecretArn([string]$SecretId) {
+  try {
+    $arn = (aws secretsmanager describe-secret --secret-id $SecretId --region $Region --query "ARN" --output text 2>$null).Trim()
+    if ($arn -and $arn -ne "None") { return $arn }
+  } catch {}
+  return $null
+}
+
+$ServiceTokenArn = Resolve-SecretArn "careervoice/service-token"
+$DeepgramArn = Resolve-SecretArn "careervoice/deepgram-api-key"
+$CartesiaArn = Resolve-SecretArn "careervoice/cartesia-api-key"
+$GeminiArn = Resolve-SecretArn "careervoice/gemini-api-key"
+
+$DailyArn = Resolve-SecretArn "careervoice/daily-api-key"
+$LiveKitUrlArn = Resolve-SecretArn "careervoice/livekit-url"
+$LiveKitKeyArn = Resolve-SecretArn "careervoice/livekit-api-key"
+$LiveKitSecretArn = Resolve-SecretArn "careervoice/livekit-api-secret"
+
+$AnthropicArn = Resolve-SecretArn "careervoice/anthropic-api-key"
+$OpenAiArn = Resolve-SecretArn "careervoice/openai-api-key"
+
+# Validate required production secrets
+$MissingRequired = $false
+if (-not $ServiceTokenArn) { Write-Error "Missing required secret: careervoice/service-token"; $MissingRequired = $true }
+if (-not $DeepgramArn) { Write-Error "Missing required secret: careervoice/deepgram-api-key"; $MissingRequired = $true }
+if (-not $CartesiaArn) { Write-Error "Missing required secret: careervoice/cartesia-api-key"; $MissingRequired = $true }
+if (-not $GeminiArn) { Write-Error "Missing required secret: careervoice/gemini-api-key"; $MissingRequired = $true }
+
+$HasDaily = [bool]$DailyArn
+$HasLiveKit = [bool]($LiveKitUrlArn -and $LiveKitKeyArn -and $LiveKitSecretArn)
+
+if (-not $HasDaily -and -not $HasLiveKit) {
+  Write-Error "At least one transport (Daily or LiveKit) must have all required secrets configured."
+  $MissingRequired = $true
+}
+
+if ($MissingRequired) {
+  throw "Deployment halted due to missing required AWS Secrets Manager entries."
+}
+
+$SecretsList = @(
+  "`"CAREERVOICE_SERVICE_TOKEN`": `"$ServiceTokenArn`"",
+  "`"DEEPGRAM_API_KEY`": `"$DeepgramArn`"",
+  "`"CARTESIA_API_KEY`": `"$CartesiaArn`"",
+  "`"GEMINI_API_KEY`": `"$GeminiArn`""
+)
+
+if ($DailyArn) { $SecretsList += "`"DAILY_API_KEY`": `"$DailyArn`"" }
+if ($LiveKitUrlArn) {
+  $SecretsList += "`"LIVEKIT_URL`": `"$LiveKitUrlArn`""
+  $SecretsList += "`"LIVEKIT_API_KEY`": `"$LiveKitKeyArn`""
+  $SecretsList += "`"LIVEKIT_API_SECRET`": `"$LiveKitSecretArn`""
+}
+if ($AnthropicArn) { $SecretsList += "`"ANTHROPIC_API_KEY`": `"$AnthropicArn`"" }
+if ($OpenAiArn) { $SecretsList += "`"OPENAI_API_KEY`": `"$OpenAiArn`"" }
+
+$SecretsJson = $SecretsList -join ", "
+Write-Host "✓ All required AWS Secrets successfully verified and resolved." -ForegroundColor Green
+
+Write-Host "=== 7. Setting up Autoscaling Configuration ===" -ForegroundColor Cyan
 $AutoscalingArn = $null
 try {
   $AutoscalingArn = (aws apprunner describe-auto-scaling-configuration-by-name --auto-scaling-configuration-name $AutoscalingConfigName --region $Region --query "AutoScalingConfiguration.AutoScalingConfigurationArn" --output text).Trim()
 } catch {}
 
-if (-not $AutoscalingArn) {
+if (-not $AutoscalingArn -or $AutoscalingArn -eq "None") {
   $AutoscalingArn = (aws apprunner create-auto-scaling-configuration --auto-scaling-configuration-name $AutoscalingConfigName --min-size 1 --max-size 5 --max-concurrency 10 --region $Region --query "AutoScalingConfiguration.AutoScalingConfigurationArn" --output text).Trim()
 }
 Write-Host "Autoscaling Config ARN: $AutoscalingArn"
 
-Write-Host "=== 7. Deploying / Updating App Runner Service with Secrets ===" -ForegroundColor Cyan
+Write-Host "=== 8. Deploying / Updating App Runner Service with Secrets ===" -ForegroundColor Cyan
 $ServiceArn = (aws apprunner list-services --region $Region --query "ServiceSummaryList[?ServiceName=='$ServiceName'].ServiceArn | [0]" --output text).Trim()
 
 $SourceConfig = "{
@@ -95,22 +155,14 @@ $SourceConfig = "{
     `"ImageConfiguration`": {
       `"Port`": `"8000`",
       `"RuntimeEnvironmentVariables`": {
+        `"APP_ENV`": `"production`",
         `"CAREERVOICE_API_URL`": `"https://careervoice.pathwisse.com`",
         `"VOICE_TRANSPORT_DEFAULT`": `"daily`",
         `"VOICE_TRANSPORT_FALLBACK`": `"livekit`",
         `"GEMINI_MODEL`": `"gemini-3.6-flash`"
       },
       `"RuntimeEnvironmentSecrets`": {
-        `"DAILY_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/daily-api-key`",
-        `"LIVEKIT_URL`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/livekit-url`",
-        `"LIVEKIT_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/livekit-api-key`",
-        `"LIVEKIT_API_SECRET`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/livekit-api-secret`",
-        `"DEEPGRAM_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/deepgram-api-key`",
-        `"CARTESIA_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/cartesia-api-key`",
-        `"GEMINI_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/gemini-api-key`",
-        `"ANTHROPIC_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/anthropic-api-key`",
-        `"OPENAI_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/openai-api-key`",
-        `"CAREERVOICE_SERVICE_TOKEN`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/service-token`"
+        $SecretsJson
       }
     }
   },
@@ -155,20 +207,22 @@ while ($true) {
 }
 
 $ServiceUrl = (aws apprunner describe-service --service-arn $ServiceArn --region $Region --query "Service.ServiceUrl" --output text).Trim()
-Write-Host "=== App Runner Deployment Succeeded ===" -ForegroundColor Green
+Write-Host "=== App Runner Deployment Reached RUNNING ===" -ForegroundColor Green
 Write-Host "Service URL: https://$ServiceUrl"
 
-Write-Host "Validating /health..."
+Write-Host "=== 9. Validating /health and /ready Deployment Gates ===" -ForegroundColor Cyan
 $HealthRes = Invoke-WebRequest -Uri "https://$ServiceUrl/health" -UseBasicParsing
 if ($HealthRes.StatusCode -ne 200) {
   Write-Error "/health failed with status $($HealthRes.StatusCode)"
+  exit 1
 }
-Write-Host "✓ /health returned 200"
+Write-Host "✓ /health returned 200" -ForegroundColor Green
 
-Write-Host "Validating /ready..."
-try {
-  $ReadyRes = Invoke-WebRequest -Uri "https://$ServiceUrl/ready" -UseBasicParsing
-  Write-Host "✓ /ready returned $($ReadyRes.StatusCode)"
-} catch {
-  Write-Warning "/ready returned error or 503 (check Secrets Manager credentials)"
+$ReadyRes = Invoke-WebRequest -Uri "https://$ServiceUrl/ready" -UseBasicParsing
+if ($ReadyRes.StatusCode -ne 200) {
+  Write-Error "/ready failed with status $($ReadyRes.StatusCode). Service is NOT production ready!"
+  exit 1
 }
+Write-Host "✓ /ready returned 200" -ForegroundColor Green
+
+Write-Host "=== Deployment Completed and Production Verified Successfully ===" -ForegroundColor Green

@@ -3,7 +3,7 @@ import secrets
 import asyncio
 from typing import Optional, Dict, Any
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Response, status
-from pydantic import BaseModel, Field, constr
+from pydantic import BaseModel, Field
 from loguru import logger
 from dotenv import load_dotenv
 
@@ -15,7 +15,7 @@ load_dotenv()
 app = FastAPI(
     title="Pathwisse CareerVoice Pipecat Voice Server",
     description="Dual Transport (Daily + LiveKit) Real-time Voice Agent for Career Audits",
-    version="2.1.0",
+    version="2.2.0",
 )
 
 
@@ -47,12 +47,25 @@ class StartSessionResponse(BaseModel):
 
 def verify_service_token(authorization: Optional[str] = Header(default=None)):
     """
-    Validates the shared service authorization token using constant-time comparison.
-    If CAREERVOICE_SERVICE_TOKEN is configured in environment, incoming requests MUST supply matching Bearer token.
+    Validates service authorization token using constant-time comparison.
+    In production (APP_ENV=production), missing CAREERVOICE_SERVICE_TOKEN or missing/invalid
+    Bearer authorization will fail-closed and reject the request with HTTP 401.
     """
+    app_env = os.getenv("APP_ENV", "development").strip().lower()
     expected_token = os.getenv("CAREERVOICE_SERVICE_TOKEN", "").strip()
+
+    # Fail closed in production if service token is unconfigured
+    if app_env == "production" and not expected_token:
+        logger.error("auth_failed_production_unconfigured_service_token")
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Production environment requires CAREERVOICE_SERVICE_TOKEN to be configured.",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
     if not expected_token:
-        # In local development if not configured, allow with warning
+        # Development / local testing without token configured
+        logger.warning("auth_skipped_dev_mode_no_service_token")
         return
 
     if not authorization:
@@ -96,8 +109,12 @@ def health_check():
 def readiness_check(response: Response):
     """
     Readiness probe reporting transport & AI provider configuration status without exposing secrets.
-    Returns HTTP 200 when ready, HTTP 503 when dependencies are missing.
+    Returns HTTP 200 when ready, HTTP 503 when dependencies or production auth are missing.
     """
+    app_env = os.getenv("APP_ENV", "development").strip().lower()
+    service_token_ok = bool(os.getenv("CAREERVOICE_SERVICE_TOKEN", "").strip())
+    auth_ok = service_token_ok if app_env == "production" else True
+
     deepgram_ok = bool(os.getenv("DEEPGRAM_API_KEY", "").strip())
     cartesia_ok = bool(os.getenv("CARTESIA_API_KEY", "").strip())
     gemini_ok = bool(os.getenv("GEMINI_API_KEY", "").strip())
@@ -108,13 +125,14 @@ def readiness_check(response: Response):
     transport_status = router.get_readiness_status()
     has_any_transport = any(t["configured"] for t in transport_status.values())
 
-    is_ready = has_any_transport and llm_ok and deepgram_ok and cartesia_ok
+    is_ready = has_any_transport and llm_ok and deepgram_ok and cartesia_ok and auth_ok
 
     if not is_ready:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
 
     return {
         "status": "ready" if is_ready else "not_ready",
+        "environment": app_env,
         "transports": transport_status,
         "defaultTransport": router.default_transport,
         "fallbackTransport": router.fallback_transport,
@@ -125,6 +143,7 @@ def readiness_check(response: Response):
             "gemini": gemini_ok,
             "anthropic": anthropic_ok,
             "openai": openai_ok,
+            "serviceAuth": service_token_ok,
         },
     }
 
@@ -135,7 +154,7 @@ async def start_voice_session(
     background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(default=None),
 ):
-    # Enforce service-level authentication
+    # Enforce service-level authentication (fails closed in production)
     verify_service_token(authorization)
 
     audit_id = sanitize_identifier(req.auditId)

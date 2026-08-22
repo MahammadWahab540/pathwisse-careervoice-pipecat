@@ -102,14 +102,79 @@ if [ -z "$RUNTIME_ROLE_ARN" ]; then
 fi
 echo "App Runner Runtime Role ARN: ${RUNTIME_ROLE_ARN}"
 
-echo "=== 6. Setting up Autoscaling Configuration ==="
-# Concurrency 10 chosen due to WebRTC VAD and real-time audio pipeline load
+echo "=== 6. Dynamically Resolving AWS Secrets Manager ARNs ==="
+resolve_secret_arn() {
+  local secret_id="$1"
+  local arn
+  arn=$(aws secretsmanager describe-secret --secret-id "${secret_id}" --region "${REGION}" --query "ARN" --output text 2>/dev/null || true)
+  if [ "$arn" == "None" ] || [ -z "$arn" ]; then
+    echo ""
+  else
+    echo "$arn"
+  fi
+}
+
+SERVICE_TOKEN_ARN=$(resolve_secret_arn "careervoice/service-token")
+DEEPGRAM_ARN=$(resolve_secret_arn "careervoice/deepgram-api-key")
+CARTESIA_ARN=$(resolve_secret_arn "careervoice/cartesia-api-key")
+GEMINI_ARN=$(resolve_secret_arn "careervoice/gemini-api-key")
+
+DAILY_ARN=$(resolve_secret_arn "careervoice/daily-api-key")
+LIVEKIT_URL_ARN=$(resolve_secret_arn "careervoice/livekit-url")
+LIVEKIT_KEY_ARN=$(resolve_secret_arn "careervoice/livekit-api-key")
+LIVEKIT_SECRET_ARN=$(resolve_secret_arn "careervoice/livekit-api-secret")
+
+ANTHROPIC_ARN=$(resolve_secret_arn "careervoice/anthropic-api-key")
+OPENAI_ARN=$(resolve_secret_arn "careervoice/openai-api-key")
+
+# Validate required production secrets
+MISSING_REQUIRED=0
+if [ -z "$SERVICE_TOKEN_ARN" ]; then echo "ERROR: Missing required secret: careervoice/service-token"; MISSING_REQUIRED=1; fi
+if [ -z "$DEEPGRAM_ARN" ]; then echo "ERROR: Missing required secret: careervoice/deepgram-api-key"; MISSING_REQUIRED=1; fi
+if [ -z "$CARTESIA_ARN" ]; then echo "ERROR: Missing required secret: careervoice/cartesia-api-key"; MISSING_REQUIRED=1; fi
+if [ -z "$GEMINI_ARN" ]; then echo "ERROR: Missing required secret: careervoice/gemini-api-key"; MISSING_REQUIRED=1; fi
+
+HAS_DAILY=0
+if [ -n "$DAILY_ARN" ]; then HAS_DAILY=1; fi
+
+HAS_LIVEKIT=0
+if [ -n "$LIVEKIT_URL_ARN" ] && [ -n "$LIVEKIT_KEY_ARN" ] && [ -n "$LIVEKIT_SECRET_ARN" ]; then HAS_LIVEKIT=1; fi
+
+if [ $HAS_DAILY -eq 0 ] && [ $HAS_LIVEKIT -eq 0 ]; then
+  echo "ERROR: At least one transport (Daily or LiveKit) must have required secrets configured."
+  MISSING_REQUIRED=1
+fi
+
+if [ $MISSING_REQUIRED -ne 0 ]; then
+  echo "Deployment halted due to missing required AWS Secrets Manager entries."
+  exit 1
+fi
+
+# Build RuntimeEnvironmentSecrets JSON with resolved real ARNs
+SECRETS_JSON="\"CAREERVOICE_SERVICE_TOKEN\": \"${SERVICE_TOKEN_ARN}\", \"DEEPGRAM_API_KEY\": \"${DEEPGRAM_ARN}\", \"CARTESIA_API_KEY\": \"${CARTESIA_ARN}\", \"GEMINI_API_KEY\": \"${GEMINI_ARN}\""
+
+if [ -n "$DAILY_ARN" ]; then
+  SECRETS_JSON="${SECRETS_JSON}, \"DAILY_API_KEY\": \"${DAILY_ARN}\""
+fi
+if [ -n "$LIVEKIT_URL_ARN" ]; then
+  SECRETS_JSON="${SECRETS_JSON}, \"LIVEKIT_URL\": \"${LIVEKIT_URL_ARN}\", \"LIVEKIT_API_KEY\": \"${LIVEKIT_KEY_ARN}\", \"LIVEKIT_API_SECRET\": \"${LIVEKIT_SECRET_ARN}\""
+fi
+if [ -n "$ANTHROPIC_ARN" ]; then
+  SECRETS_JSON="${SECRETS_JSON}, \"ANTHROPIC_API_KEY\": \"${ANTHROPIC_ARN}\""
+fi
+if [ -n "$OPENAI_ARN" ]; then
+  SECRETS_JSON="${SECRETS_JSON}, \"OPENAI_API_KEY\": \"${OPENAI_ARN}\""
+fi
+
+echo "✓ All required AWS Secrets successfully verified and resolved."
+
+echo "=== 7. Setting up Autoscaling Configuration ==="
 AUTOSCALING_ARN=$(aws apprunner describe-auto-scaling-configuration-by-name \
   --auto-scaling-configuration-name "${AUTOSCALING_CONFIG_NAME}" \
   --region "${REGION}" \
   --query "AutoScalingConfiguration.AutoScalingConfigurationArn" --output text 2>/dev/null || true)
 
-if [ -z "$AUTOSCALING_ARN" ]; then
+if [ -z "$AUTOSCALING_ARN" ] || [ "$AUTOSCALING_ARN" == "None" ]; then
   echo "Creating Autoscaling Configuration: ${AUTOSCALING_CONFIG_NAME}"
   AUTOSCALING_ARN=$(aws apprunner create-auto-scaling-configuration \
     --auto-scaling-configuration-name "${AUTOSCALING_CONFIG_NAME}" \
@@ -121,7 +186,7 @@ if [ -z "$AUTOSCALING_ARN" ]; then
 fi
 echo "Autoscaling Config ARN: ${AUTOSCALING_ARN}"
 
-echo "=== 7. Deploying / Updating App Runner Service with Secrets ==="
+echo "=== 8. Deploying / Updating App Runner Service with Secrets ==="
 SERVICE_ARN=$(aws apprunner list-services --region "${REGION}" --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn | [0]" --output text)
 
 SOURCE_CONFIG="{
@@ -131,22 +196,14 @@ SOURCE_CONFIG="{
     \"ImageConfiguration\": {
       \"Port\": \"8000\",
       \"RuntimeEnvironmentVariables\": {
+        \"APP_ENV\": \"production\",
         \"CAREERVOICE_API_URL\": \"https://careervoice.pathwisse.com\",
         \"VOICE_TRANSPORT_DEFAULT\": \"daily\",
         \"VOICE_TRANSPORT_FALLBACK\": \"livekit\",
         \"GEMINI_MODEL\": \"gemini-3.6-flash\"
       },
       \"RuntimeEnvironmentSecrets\": {
-        \"DAILY_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/daily-api-key\",
-        \"LIVEKIT_URL\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/livekit-url\",
-        \"LIVEKIT_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/livekit-api-key\",
-        \"LIVEKIT_API_SECRET\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/livekit-api-secret\",
-        \"DEEPGRAM_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/deepgram-api-key\",
-        \"CARTESIA_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/cartesia-api-key\",
-        \"GEMINI_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/gemini-api-key\",
-        \"ANTHROPIC_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/anthropic-api-key\",
-        \"OPENAI_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/openai-api-key\",
-        \"CAREERVOICE_SERVICE_TOKEN\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/service-token\"
+        ${SECRETS_JSON}
       }
     }
   },
@@ -184,7 +241,7 @@ while true; do
   if [ "$STATUS" == "RUNNING" ]; then
     break
   elif [ "$STATUS" == "CREATE_FAILED" ] || [ "$STATUS" == "OPERATION_FAILED" ]; then
-    echo "App Runner service operation failed. Inspect AWS CloudWatch logs."
+    echo "ERROR: App Runner service operation failed. Inspect AWS CloudWatch logs."
     exit 1
   fi
   sleep 15
@@ -194,6 +251,7 @@ SERVICE_URL=$(aws apprunner describe-service --service-arn "${SERVICE_ARN}" --re
 echo "=== App Runner Deployment Reached RUNNING ==="
 echo "Service URL: https://${SERVICE_URL}"
 
+echo "=== 9. Validating /health and /ready Deployment Gates ==="
 echo "Validating /health endpoint..."
 HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://${SERVICE_URL}/health")
 if [ "$HEALTH_CODE" != "200" ]; then
@@ -205,9 +263,9 @@ echo "✓ /health returned HTTP 200"
 echo "Validating /ready endpoint..."
 READY_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://${SERVICE_URL}/ready")
 if [ "$READY_CODE" != "200" ]; then
-  echo "WARNING: /ready check returned HTTP ${READY_CODE}. Check configured secrets in Secrets Manager."
-else
-  echo "✓ /ready returned HTTP 200"
+  echo "ERROR: /ready check returned HTTP ${READY_CODE} (expected 200). Service is NOT production ready!"
+  exit 1
 fi
+echo "✓ /ready returned HTTP 200"
 
-echo "=== Deployment Completed Successfully ==="
+echo "=== Deployment Completed and Production Verified Successfully ==="

@@ -15,7 +15,7 @@ from transports.livekit_transport import (
     generate_livekit_token,
 )
 from transports.factory import TransportRouter
-from bot import create_llm_service
+from bot import create_llm_service, notify_careervoice_signal
 from server import app
 
 client = TestClient(app)
@@ -189,8 +189,34 @@ async def test_router_both_fail_raises_runtime_error():
 
 
 # ==============================================================================
-# 6. Service Token Authentication Tests
+# 6. Service Token Authentication & Production Fail-Closed Tests
 # ==============================================================================
+def test_production_missing_service_token_fails_closed_401():
+    with patch.dict(os.environ, {"APP_ENV": "production", "CAREERVOICE_SERVICE_TOKEN": ""}):
+        response = client.post(
+            "/api/voice/session",
+            json={"auditId": "test_prod_auth", "targetRole": "Engineer"},
+        )
+        assert response.status_code == 401
+        assert "Production environment requires CAREERVOICE_SERVICE_TOKEN" in response.json()["detail"]
+
+
+def test_production_missing_service_token_fails_readiness_503():
+    ready_env = {
+        "APP_ENV": "production",
+        "CAREERVOICE_SERVICE_TOKEN": "",
+        "DAILY_API_KEY": "daily-key",
+        "DEEPGRAM_API_KEY": "deepgram-key",
+        "CARTESIA_API_KEY": "cartesia-key",
+        "GEMINI_API_KEY": "gemini-key",
+    }
+    with patch.dict(os.environ, ready_env):
+        with patch.object(DailyVoiceTransportProvider, "is_configured", return_value=True):
+            response = client.get("/ready")
+            assert response.status_code == 503
+            assert response.json()["providers"]["serviceAuth"] is False
+
+
 def test_auth_missing_token_returns_401():
     with patch.dict(os.environ, {"CAREERVOICE_SERVICE_TOKEN": "secret-token-xyz-123"}):
         response = client.post(
@@ -243,21 +269,22 @@ def test_auth_valid_token_accepted():
 # 7. Backward Compatibility Tests (Pre-provisioned Daily Room)
 # ==============================================================================
 def test_backward_compatibility_pre_provisioned_room():
-    response = client.post(
-        "/api/voice/session",
-        json={
-            "auditId": "legacy_audit",
-            "targetRole": "Frontend Developer",
-            "roomUrl": "https://careervoice.daily.co/legacy-room",
-            "token": "legacy-token-789",
-        },
-    )
-    assert response.status_code == 200
-    data = response.json()
-    assert data["provider"] == "daily"
-    assert data["roomUrl"] == "https://careervoice.daily.co/legacy-room"
-    assert data["token"] == "legacy-token-789"
-    assert data["connection"]["url"] == "https://careervoice.daily.co/legacy-room"
+    with patch.dict(os.environ, {"APP_ENV": "development", "CAREERVOICE_SERVICE_TOKEN": ""}):
+        response = client.post(
+            "/api/voice/session",
+            json={
+                "auditId": "legacy_audit",
+                "targetRole": "Frontend Developer",
+                "roomUrl": "https://careervoice.daily.co/legacy-room",
+                "token": "legacy-token-789",
+            },
+        )
+        assert response.status_code == 200
+        data = response.json()
+        assert data["provider"] == "daily"
+        assert data["roomUrl"] == "https://careervoice.daily.co/legacy-room"
+        assert data["token"] == "legacy-token-789"
+        assert data["connection"]["url"] == "https://careervoice.daily.co/legacy-room"
 
 
 # ==============================================================================
@@ -274,6 +301,8 @@ def test_readiness_not_ready_returns_503():
 
 def test_readiness_ready_returns_200():
     ready_env = {
+        "APP_ENV": "production",
+        "CAREERVOICE_SERVICE_TOKEN": "secret-service-token",
         "DAILY_API_KEY": "daily-key-123",
         "DEEPGRAM_API_KEY": "deepgram-key-123",
         "CARTESIA_API_KEY": "cartesia-key-123",
@@ -290,3 +319,30 @@ def test_readiness_ready_returns_200():
             assert data["providers"]["deepgram"] is True
             assert data["providers"]["cartesia"] is True
             assert data["providers"]["llm"] is True
+            assert data["providers"]["serviceAuth"] is True
+
+
+# ==============================================================================
+# 9. Evidence Persistence Callback Tests
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_notify_careervoice_signal_execution():
+    with patch("aiohttp.ClientSession.post") as mock_post:
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_post.return_value.__aenter__.return_value = mock_resp
+
+        await notify_careervoice_signal(
+            audit_id="audit-evidence-01",
+            skill_name="React State Management",
+            extracted_level="Advanced",
+            confidence_score=92,
+            evidence_strength="strong",
+            raw_answer="Candidate explained custom Redux toolkit middleware.",
+        )
+
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args
+        assert "/api/audit/evidence/signal" in call_args[0][0]
+        assert call_args[1]["json"]["auditId"] == "audit-evidence-01"
+        assert call_args[1]["json"]["skillName"] == "React State Management"

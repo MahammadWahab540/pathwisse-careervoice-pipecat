@@ -54,9 +54,19 @@ async def notify_careervoice_signal(
                 "source": "pipecat_voice_probe",
             }
             async with session.post(
-                f"{CAREERVOICE_API_URL}/api/audit/evidence/signal", json=payload, timeout=aiohttp.ClientTimeout(total=5)
+                f"{CAREERVOICE_API_URL}/api/audit/evidence/signal",
+                json=payload,
+                timeout=aiohttp.ClientTimeout(total=5),
             ) as resp:
-                if resp.status not in (200, 201):
+                if resp.status in (200, 201):
+                    logger.info(
+                        "voice_evidence_persisted",
+                        audit_id=audit_id,
+                        skill_name=skill_name,
+                        extracted_level=extracted_level,
+                        confidence_score=confidence_score,
+                    )
+                else:
                     logger.warning(
                         "careervoice_signal_failed",
                         audit_id=audit_id,
@@ -137,6 +147,13 @@ async def run_careervoice_agent(session_config: VoiceSessionConfig):
         provider = router.get_provider(provider_name)
         transport = provider.create_pipecat_transport(session_config)
 
+        logger.info(
+            "voice_bot_joined",
+            audit_id=audit_id,
+            provider=provider_name,
+            room_name=session_config.room_name,
+        )
+
         # STT & TTS Providers
         stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
         tts = CartesiaTTSService(
@@ -207,6 +224,7 @@ Rules:
             audit_id=audit_id,
             provider=provider_name,
             duration=duration,
+            failureStage="pipeline_execution",
             error=str(e),
         )
         raise
