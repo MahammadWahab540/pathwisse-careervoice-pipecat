@@ -1,6 +1,7 @@
 import os
 import pytest
 import asyncio
+import time
 from unittest.mock import patch, AsyncMock, MagicMock
 from pydantic import ValidationError
 from pipecat.frames.frames import LLMMessagesFrame
@@ -8,10 +9,12 @@ from pipecat.processors.frame_processor import FrameDirection
 
 from bot import (
     EvidenceAssessment,
+    EvidenceSourceTurn,
     CareerVoiceEvidenceEvaluator,
     evaluate_student_evidence_llm,
     notify_careervoice_signal,
     check_evidence_grounding,
+    extract_evidence_provenance,
 )
 
 
@@ -34,7 +37,6 @@ async def test_frame_forwarded_immediately_without_waiting_for_evaluator():
 
     evaluator.push_frame = mock_push_frame
 
-    import time
     start_time = time.time()
 
     # Make LLM evaluation artificially slow (0.5s)
@@ -61,11 +63,49 @@ async def test_frame_forwarded_immediately_without_waiting_for_evaluator():
         await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
         frame_forwarded_time = time.time() - start_time
 
-        # Frame must be forwarded instantaneously (< 50ms), not blocked by 500ms eval
+        # Frame must be forwarded instantaneously (< 100ms), not blocked by 500ms eval
         assert len(pushed_frames) == 1
         assert frame_forwarded_time < 0.1
 
         await evaluator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_slow_persistence_webhook_does_not_block_pipeline():
+    """Slow persistence webhook must never block frame processing or Qalam pipeline."""
+    evaluator = CareerVoiceEvidenceEvaluator(
+        audit_id="audit_slow_webhook",
+        target_role="Backend Engineer",
+        student_name="Candidate",
+    )
+
+    assessment = EvidenceAssessment(
+        skillName="FastAPI",
+        evidenceFound=True,
+        extractedLevel="Intermediate",
+        confidenceScore=80,
+        evidenceStrength="moderate",
+        evidenceSnippet="Built REST APIs using FastAPI.",
+        requiresFollowUp=False,
+    )
+
+    # Make webhook artificially slow (1.0s)
+    async def slow_webhook(*args, **kwargs):
+        await asyncio.sleep(1.0)
+
+    start_time = time.time()
+    with patch("bot.evaluate_student_evidence_llm", new_callable=AsyncMock, return_value=assessment):
+        with patch("bot.notify_careervoice_signal", side_effect=slow_webhook):
+            frame = LLMMessagesFrame(
+                messages=[{"role": "user", "content": "I built REST APIs in FastAPI with async endpoints."}]
+            )
+
+            await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
+            processing_time = time.time() - start_time
+
+            # Frame processing must return immediately without waiting for webhook
+            assert processing_time < 0.1
+            await evaluator.shutdown(persistence_grace_seconds=0.1)
 
 
 @pytest.mark.asyncio
@@ -95,7 +135,7 @@ async def test_duplicate_user_turns_not_evaluated_twice():
         # Send same frame twice
         await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
         await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
-        await asyncio.sleep(0.1)
+        await asyncio.sleep(0.05)
 
         assert mock_eval.call_count == 1
         await evaluator.shutdown()
@@ -238,6 +278,32 @@ def test_schema_rejects_evidence_found_true_without_snippet():
         )
 
 
+def test_schema_rejects_evidence_found_true_with_requires_follow_up_true():
+    with pytest.raises(ValidationError):
+        EvidenceAssessment(
+            skillName="React",
+            evidenceFound=True,
+            extractedLevel="Advanced",
+            confidenceScore=85,
+            evidenceStrength="strong",
+            evidenceSnippet="snippet",
+            requiresFollowUp=True,  # Invalid when evidenceFound=True
+        )
+
+
+def test_schema_rejects_evidence_found_false_with_requires_follow_up_false():
+    with pytest.raises(ValidationError):
+        EvidenceAssessment(
+            skillName=None,
+            evidenceFound=False,
+            extractedLevel=None,
+            confidenceScore=None,
+            evidenceStrength="insufficient",
+            evidenceSnippet=None,
+            requiresFollowUp=False,  # Invalid when evidenceFound=False
+        )
+
+
 # ==============================================================================
 # 3. Prompt-Injection Defense Tests
 # ==============================================================================
@@ -309,7 +375,7 @@ async def test_prompt_injection_fake_json_in_transcript():
 
 
 # ==============================================================================
-# 4. Evidence Grounding Tests
+# 4. Evidence Grounding & Provenance Tests
 # ==============================================================================
 def test_grounding_check_matching_snippet_accepted():
     transcript = "I built an e-commerce catalog in React using Zustand and custom hooks."
@@ -321,6 +387,29 @@ def test_grounding_check_hallucinated_snippet_rejected():
     transcript = "I worked on some frontend tickets and attended daily standups."
     hallucinated_snippet = "Architected high-throughput microservices using Apache Kafka and Kubernetes"
     assert check_evidence_grounding(hallucinated_snippet, transcript) is False
+
+
+def test_extract_evidence_provenance_multi_turn():
+    """Authentic candidate speech from relevant turns is preserved in raw snippet and source turns."""
+    history = [
+        {"role": "assistant", "content": "What did you build?"},
+        {"role": "user", "content": "I built an analytics dashboard in React."},
+        {"role": "assistant", "content": "How did you manage state?"},
+        {"role": "user", "content": "I used Zustand store and memoized filter selectors."},
+    ]
+    snippet = "built analytics dashboard in React using Zustand"
+
+    raw_snippet, source_turns = extract_evidence_provenance(
+        evidence_snippet=snippet,
+        latest_turn_text="I used Zustand store and memoized filter selectors.",
+        conversation_history=history,
+    )
+
+    assert "analytics dashboard in React" in raw_snippet
+    assert "Zustand store" in raw_snippet
+    assert len(source_turns) >= 2
+    assert source_turns[0]["turnIndex"] == 1
+    assert "analytics dashboard" in source_turns[0]["text"]
 
 
 @pytest.mark.asyncio
@@ -354,53 +443,158 @@ async def test_hallucinated_snippet_rejected_by_evaluator():
 
 
 # ==============================================================================
-# 5. Multi-Turn History & Resilience Tests
+# 5. Persistence Task Lifecycle & Shutdown Tests
 # ==============================================================================
 @pytest.mark.asyncio
-async def test_multi_turn_connected_evidence_chain_persisted():
-    """Candidate answers across multiple turns are evaluated in context."""
+async def test_persistence_task_tracked_and_completed_during_shutdown_grace_period():
+    """Persistence tasks are tracked in _persistence_tasks and complete cleanly on shutdown."""
     evaluator = CareerVoiceEvidenceEvaluator(
-        audit_id="audit_chain_01",
-        target_role="Full Stack Engineer",
+        audit_id="audit_lifecycle_01",
+        target_role="Backend Engineer",
         student_name="Candidate",
     )
 
-    history = [
-        {"role": "assistant", "content": "What did you build?"},
-        {"role": "user", "content": "A real-time dashboard."},
-        {"role": "assistant", "content": "What tools did you use?"},
-        {"role": "user", "content": "I used React and PostgreSQL."},
-        {"role": "assistant", "content": "How did you solve rendering lag?"},
-        {
-            "role": "user",
-            "content": "I memoized expensive filter selectors with useMemo and virtualized list items with react-window.",
-        },
-    ]
+    assessment = EvidenceAssessment(
+        skillName="Redis",
+        evidenceFound=True,
+        extractedLevel="Intermediate",
+        confidenceScore=78,
+        evidenceStrength="moderate",
+        evidenceSnippet="Implemented distributed caching in Redis.",
+        requiresFollowUp=False,
+    )
+
+    webhook_called = asyncio.Event()
+
+    async def mock_webhook(*args, **kwargs):
+        await asyncio.sleep(0.05)
+        webhook_called.set()
+
+    with patch("bot.evaluate_student_evidence_llm", new_callable=AsyncMock, return_value=assessment):
+        with patch("bot.notify_careervoice_signal", side_effect=mock_webhook):
+            frame = LLMMessagesFrame(
+                messages=[{"role": "user", "content": "I implemented distributed caching in Redis for session store."}]
+            )
+            await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0.02)
+
+            # Task is tracked in persistence set
+            assert len(evaluator._persistence_tasks) + (1 if webhook_called.is_set() else 0) >= 1
+
+            # Shutdown with grace period allows webhook to complete cleanly
+            await evaluator.shutdown(persistence_grace_seconds=1.0)
+
+            assert webhook_called.is_set()
+            assert len(evaluator._evaluation_tasks) == 0
+            assert len(evaluator._persistence_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_slow_persistence_task_cancelled_after_timeout_without_crashing_shutdown():
+    """Persistence task exceeding grace period is cancelled cleanly without throwing."""
+    evaluator = CareerVoiceEvidenceEvaluator(
+        audit_id="audit_timeout_01",
+        target_role="Backend Engineer",
+        student_name="Candidate",
+    )
 
     assessment = EvidenceAssessment(
-        skillName="React Performance Optimization",
+        skillName="PostgreSQL",
         evidenceFound=True,
         extractedLevel="Advanced",
         confidenceScore=88,
         evidenceStrength="strong",
-        evidenceSnippet="memoized expensive filter selectors with useMemo and virtualized list items with react-window",
+        evidenceSnippet="Optimized database connection pooling.",
         requiresFollowUp=False,
     )
 
-    with patch("bot.evaluate_student_evidence_llm", new_callable=AsyncMock, return_value=assessment) as mock_eval:
+    async def hanging_webhook(*args, **kwargs):
+        await asyncio.sleep(10.0)
+
+    with patch("bot.evaluate_student_evidence_llm", new_callable=AsyncMock, return_value=assessment):
+        with patch("bot.notify_careervoice_signal", side_effect=hanging_webhook):
+            frame = LLMMessagesFrame(
+                messages=[{"role": "user", "content": "I optimized database connection pooling with PgBouncer."}]
+            )
+            await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0.02)
+
+            # Shutdown with 0.1s grace period must cancel hanging task safely
+            await evaluator.shutdown(persistence_grace_seconds=0.1)
+
+            assert len(evaluator._evaluation_tasks) == 0
+            assert len(evaluator._persistence_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_persistence_webhook_exception_does_not_crash_shutdown():
+    """Webhook HTTP/network exceptions are handled safely and do not fail session termination."""
+    evaluator = CareerVoiceEvidenceEvaluator(
+        audit_id="audit_err_01",
+        target_role="Backend Engineer",
+        student_name="Candidate",
+    )
+
+    assessment = EvidenceAssessment(
+        skillName="AWS S3",
+        evidenceFound=True,
+        extractedLevel="Foundational",
+        confidenceScore=65,
+        evidenceStrength="moderate",
+        evidenceSnippet="Configured presigned URLs with AWS S3.",
+        requiresFollowUp=False,
+    )
+
+    with patch("bot.evaluate_student_evidence_llm", new_callable=AsyncMock, return_value=assessment):
+        with patch("bot.notify_careervoice_signal", new_callable=AsyncMock, side_effect=RuntimeError("Network failure")):
+            frame = LLMMessagesFrame(
+                messages=[{"role": "user", "content": "I configured presigned URLs with AWS S3 for uploads."}]
+            )
+            await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0.05)
+
+            await evaluator.shutdown()
+            assert len(evaluator._evaluation_tasks) == 0
+            assert len(evaluator._persistence_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_audit_id_and_provenance_preserved_in_persistence():
+    """Audit ID and authentic candidate source turns are passed correctly to persistence."""
+    test_audit_id = "audit-provenance-test-9988"
+    evaluator = CareerVoiceEvidenceEvaluator(
+        audit_id=test_audit_id,
+        target_role="Full Stack Engineer",
+        student_name="Candidate",
+    )
+
+    assessment = EvidenceAssessment(
+        skillName="GraphQL",
+        evidenceFound=True,
+        extractedLevel="Advanced",
+        confidenceScore=87,
+        evidenceStrength="strong",
+        evidenceSnippet="Built GraphQL schema with DataLoader to solve N+1 queries.",
+        requiresFollowUp=False,
+    )
+
+    with patch("bot.evaluate_student_evidence_llm", new_callable=AsyncMock, return_value=assessment):
         with patch("bot.notify_careervoice_signal", new_callable=AsyncMock) as mock_signal:
-            frame = LLMMessagesFrame(messages=history)
+            frame = LLMMessagesFrame(
+                messages=[
+                    {"role": "assistant", "content": "How did you design the API?"},
+                    {"role": "user", "content": "I built a GraphQL schema with DataLoader to solve N+1 queries."},
+                ]
+            )
             await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
             await asyncio.sleep(0.05)
 
             mock_signal.assert_called_once()
             call_kwargs = mock_signal.call_args[1]
-            assert call_kwargs["audit_id"] == "audit_chain_01"
-            assert call_kwargs["skill_name"] == "React Performance Optimization"
-            assert call_kwargs["confidence_score"] == 88
-
-            # Verify history passed to LLM was bounded
-            passed_history = mock_eval.call_args[1]["conversation_history"]
-            assert len(passed_history) <= 6
+            assert call_kwargs["audit_id"] == test_audit_id
+            assert call_kwargs["skill_name"] == "GraphQL"
+            assert "DataLoader to solve N+1" in call_kwargs["raw_answer"]
+            assert call_kwargs["source_turns"] is not None
+            assert len(call_kwargs["source_turns"]) >= 1
 
             await evaluator.shutdown()

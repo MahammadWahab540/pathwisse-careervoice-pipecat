@@ -39,8 +39,13 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 
 # ==============================================================================
-# Strict Pydantic Schema Validation for Evidence Assessment
+# Strict Pydantic Schema Validation for Evidence Assessment & Provenance
 # ==============================================================================
+class EvidenceSourceTurn(BaseModel):
+    turnIndex: int
+    text: str
+
+
 class EvidenceAssessment(BaseModel):
     skillName: Optional[str] = None
     evidenceFound: bool
@@ -57,7 +62,7 @@ class EvidenceAssessment(BaseModel):
         if self.confidenceScore is not None and not (0 <= self.confidenceScore <= 100):
             raise ValueError(f"confidenceScore must be between 0 and 100, got {self.confidenceScore}")
 
-        # Rule 2: When evidenceFound == False -> no score, no level, strength must be insufficient
+        # Rule 2: When evidenceFound == False -> no score, no level, strength must be insufficient, requiresFollowUp=True
         if not self.evidenceFound:
             if self.extractedLevel is not None:
                 raise ValueError("extractedLevel must be null when evidenceFound=false")
@@ -65,8 +70,10 @@ class EvidenceAssessment(BaseModel):
                 raise ValueError("confidenceScore must be null when evidenceFound=false")
             if self.evidenceStrength != "insufficient":
                 raise ValueError(f"evidenceStrength must be 'insufficient' when evidenceFound=false, got {self.evidenceStrength}")
+            if not self.requiresFollowUp:
+                raise ValueError("requiresFollowUp must be true when evidenceFound=false")
         else:
-            # Rule 3: When evidenceFound == True -> skillName, extractedLevel, confidenceScore, snippet required
+            # Rule 3: When evidenceFound == True -> skillName, extractedLevel, confidenceScore, snippet required, requiresFollowUp=False
             if not self.skillName or not self.skillName.strip():
                 raise ValueError("skillName is required when evidenceFound=true")
             if not self.extractedLevel:
@@ -77,6 +84,8 @@ class EvidenceAssessment(BaseModel):
                 raise ValueError("evidenceSnippet is required when evidenceFound=true")
             if self.evidenceStrength not in ("moderate", "strong"):
                 raise ValueError(f"evidenceStrength must be 'moderate' or 'strong' when evidenceFound=true, got {self.evidenceStrength}")
+            if self.requiresFollowUp:
+                raise ValueError("requiresFollowUp must be false when evidenceFound=true")
 
         return self
 
@@ -91,19 +100,30 @@ async def notify_careervoice_signal(
     confidence_score: int,
     evidence_strength: str,
     raw_answer: str,
+    source_turns: Optional[List[Dict[str, Any]]] = None,
 ):
     """Post verified skill evidence signal asynchronously back to CareerVoice backend."""
+    logger.info(
+        "evidence_persistence_started",
+        audit_id=audit_id,
+        skill_name=skill_name,
+        extracted_level=extracted_level,
+        confidence_score=confidence_score,
+    )
     try:
+        payload: Dict[str, Any] = {
+            "auditId": audit_id,
+            "skillName": skill_name,
+            "extractedLevel": extracted_level,
+            "confidenceScore": confidence_score,
+            "evidenceStrength": evidence_strength,
+            "rawAnswerSnippet": raw_answer[:300],
+            "source": "pipecat_voice_probe",
+        }
+        if source_turns:
+            payload["evidenceSourceTurns"] = source_turns
+
         async with aiohttp.ClientSession() as session:
-            payload = {
-                "auditId": audit_id,
-                "skillName": skill_name,
-                "extractedLevel": extracted_level,
-                "confidenceScore": confidence_score,
-                "evidenceStrength": evidence_strength,
-                "rawAnswerSnippet": raw_answer[:300],
-                "source": "pipecat_voice_probe",
-            }
             async with session.post(
                 f"{CAREERVOICE_API_URL}/api/audit/evidence/signal",
                 json=payload,
@@ -111,28 +131,30 @@ async def notify_careervoice_signal(
             ) as resp:
                 if resp.status in (200, 201):
                     logger.info(
-                        "voice_evidence_persisted",
+                        "evidence_persistence_completed",
                         audit_id=audit_id,
                         skill_name=skill_name,
-                        extracted_level=extracted_level,
-                        confidence_score=confidence_score,
+                        status_code=resp.status,
                     )
                 else:
                     logger.warning(
-                        "careervoice_signal_failed",
+                        "evidence_persistence_failed",
                         audit_id=audit_id,
                         status=resp.status,
                     )
+    except asyncio.CancelledError:
+        logger.warning("evidence_persistence_cancelled", audit_id=audit_id)
+        raise
     except Exception as e:
         logger.error(
-            "careervoice_signal_post_error",
+            "evidence_persistence_failed",
             audit_id=audit_id,
             error=str(e),
         )
 
 
 # ==============================================================================
-# Evidence Grounding Verification
+# Evidence Grounding & Provenance Verification
 # ==============================================================================
 def check_evidence_grounding(
     evidence_snippet: str,
@@ -165,6 +187,44 @@ def check_evidence_grounding(
     grounding_ratio = len(matched) / len(substantive_tokens)
 
     return grounding_ratio >= 0.45
+
+
+def extract_evidence_provenance(
+    evidence_snippet: str,
+    latest_turn_text: str,
+    conversation_history: Optional[List[Dict[str, Any]]] = None,
+) -> tuple[str, List[Dict[str, Any]]]:
+    """
+    Extracts authentic candidate speech from relevant original turns supporting the evidence.
+    Returns (raw_answer_snippet, evidence_source_turns) without model paraphrasing.
+    """
+    tokens = set(re.findall(r"\b[a-zA-Z0-9_\-\.\#\+\/]{3,}\b", evidence_snippet.lower()))
+    stopwords = {"the", "and", "for", "with", "that", "this", "from", "built", "using", "project", "have", "were", "been", "where"}
+    substantive_tokens = tokens - stopwords
+    if not substantive_tokens:
+        substantive_tokens = tokens
+
+    matched_turns: List[Dict[str, Any]] = []
+    turn_idx = 1
+
+    if conversation_history:
+        for msg in conversation_history:
+            if isinstance(msg, dict) and msg.get("role") == "user":
+                text = str(msg.get("content", "")).strip()
+                if text:
+                    user_tokens = set(re.findall(r"\b[a-zA-Z0-9_\-\.\#\+\/]{3,}\b", text.lower()))
+                    if user_tokens & substantive_tokens:
+                        matched_turns.append({"turnIndex": turn_idx, "text": text})
+                turn_idx += 1
+
+    # Ensure latest turn is included if relevant or if no earlier turns matched
+    latest_user_tokens = set(re.findall(r"\b[a-zA-Z0-9_\-\.\#\+\/]{3,}\b", latest_turn_text.lower()))
+    if (latest_user_tokens & substantive_tokens) or not matched_turns:
+        if not any(t["text"] == latest_turn_text for t in matched_turns):
+            matched_turns.append({"turnIndex": turn_idx, "text": latest_turn_text})
+
+    raw_snippet = " ... ".join(t["text"] for t in matched_turns)
+    return raw_snippet[:300], matched_turns
 
 
 # ==============================================================================
@@ -335,13 +395,13 @@ Analyze the candidate transcript above according to the security and evaluation 
 
 
 # ==============================================================================
-# Non-Blocking FrameProcessor with Bounded Task Lifecycle
+# Non-Blocking FrameProcessor with Complete Task Lifecycle & Provenance Tracking
 # ==============================================================================
 class CareerVoiceEvidenceEvaluator(FrameProcessor):
     """
     Non-blocking pipeline processor that asynchronously evaluates candidate turns.
     Immediately forwards frames downstream so realtime voice synthesis is never delayed.
-    Enforces bounded concurrency, turn deduplication, and clean shutdown.
+    Enforces bounded concurrency, turn deduplication, task tracking, and graceful persistence shutdown.
     """
     def __init__(self, audit_id: str, target_role: str, student_name: str = "Candidate", max_concurrent: int = 2):
         super().__init__()
@@ -351,12 +411,19 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
         self.last_follow_up: Optional[str] = None
         self._max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
-        self._active_tasks: Set[asyncio.Task] = set()
+        self._evaluation_tasks: Set[asyncio.Task] = set()
+        self._persistence_tasks: Set[asyncio.Task] = set()
         self._evaluated_turns: Set[str] = set()
         self._turn_counter = 0
 
+    def _track_task(self, task: asyncio.Task, task_set: Set[asyncio.Task]) -> asyncio.Task:
+        """Helper to track background tasks and automatically clean them up upon completion."""
+        task_set.add(task)
+        task.add_done_callback(task_set.discard)
+        return task
+
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        # P0-1 Critical Requirement: Immediately push frame downstream (zero realtime voice latency)
+        # P0 Critical Requirement: Immediately push frame downstream (zero realtime voice latency)
         await super().process_frame(frame, direction)
         await self.push_frame(frame, direction)
 
@@ -375,8 +442,7 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                         task = asyncio.create_task(
                             self._evaluate_turn_async(content, list(messages), turn_idx)
                         )
-                        self._active_tasks.add(task)
-                        task.add_done_callback(self._active_tasks.discard)
+                        self._track_task(task, self._evaluation_tasks)
 
     async def _evaluate_turn_async(self, answer_text: str, conversation_history: List[Dict[str, str]], turn_idx: int):
         words = answer_text.split()
@@ -443,18 +509,26 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                         )
                         return
 
-                    # Persist verified signal using authentic spoken transcript slice
-                    raw_snippet = answer_text[:300]
-                    asyncio.create_task(
+                    # Provenance extraction: extract authentic original turns and text
+                    raw_provenance_snippet, source_turns = extract_evidence_provenance(
+                        assessment.evidenceSnippet or "",
+                        answer_text,
+                        conversation_history,
+                    )
+
+                    # Spawn tracked persistence task with grace period on shutdown
+                    persist_task = asyncio.create_task(
                         notify_careervoice_signal(
                             audit_id=self.audit_id,
                             skill_name=str(assessment.skillName),
                             extracted_level=str(assessment.extractedLevel),
                             confidence_score=int(assessment.confidenceScore),
                             evidence_strength=str(assessment.evidenceStrength),
-                            raw_answer=raw_snippet,
+                            raw_answer=raw_provenance_snippet,
+                            source_turns=source_turns,
                         )
                     )
+                    self._track_task(persist_task, self._persistence_tasks)
                 else:
                     if assessment.requiresFollowUp and assessment.followUpQuestion:
                         self.last_follow_up = assessment.followUpQuestion
@@ -473,22 +547,36 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                     eval_latency_ms=latency_ms,
                 )
 
-    async def shutdown(self, timeout_grace: float = 1.0):
-        """Cancels and cleans up any active background evaluation tasks on session termination."""
-        if not self._active_tasks:
-            return
-
-        for task in self._active_tasks:
+    async def shutdown(self, persistence_grace_seconds: float = 2.5):
+        """
+        Graceful session shutdown:
+        1. Immediately cancels active evaluation tasks.
+        2. Waits up to persistence_grace_seconds for pending persistence webhook tasks.
+        3. Cleans up all tracked task sets so zero orphan tasks remain.
+        """
+        # 1. Cancel evaluation tasks immediately
+        for task in list(self._evaluation_tasks):
             if not task.done():
                 task.cancel()
+        self._evaluation_tasks.clear()
 
-        try:
-            await asyncio.wait_for(
-                asyncio.gather(*self._active_tasks, return_exceptions=True),
-                timeout=timeout_grace,
-            )
-        except Exception:
-            pass
+        # 2. Wait for persistence tasks to complete within grace period
+        if self._persistence_tasks:
+            pending = list(self._persistence_tasks)
+            try:
+                done, unfinished = await asyncio.wait(pending, timeout=persistence_grace_seconds)
+                if unfinished:
+                    logger.warning(
+                        "evidence_persistence_shutdown_timeout",
+                        count=len(unfinished),
+                        audit_id=self.audit_id,
+                    )
+                    for t in unfinished:
+                        if not t.done():
+                            t.cancel()
+            except Exception as e:
+                logger.warning("evidence_persistence_shutdown_error", error=str(e))
+        self._persistence_tasks.clear()
 
 
 # ==============================================================================

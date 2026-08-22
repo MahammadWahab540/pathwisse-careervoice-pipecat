@@ -22,12 +22,13 @@ Transport Router (Daily ⇄ LiveKit pre-session failover)
       Pipecat
          ↓
   Deepgram STT
-         ↓
-CareerVoice Evidence Evaluator (LLM Structured Assessment)
-         ↓
-    Gemini 3.6 Flash (or Claude / OpenAI fallback)
-         ↓
-   Cartesia TTS
+   ┌─────┴────────────────┐
+   ↓                      ↓
+Conversational LLM    Async Evidence Evaluator (Structured LLM Assessment)
+(Gemini 3.6 Flash /        ↓
+Claude / OpenAI)      CareerVoice Persistence Webhook (POST /api/audit/evidence/signal)
+   ↓
+Cartesia TTS
 ```
 
 ---
