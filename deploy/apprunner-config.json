@@ -1,0 +1,33 @@
+{
+  "ServiceName": "careervoice-pipecat",
+  "SourceConfiguration": {
+    "ImageRepository": {
+      "ImageIdentifier": "<ECR_REPOSITORY_URI>:<IMAGE_TAG>",
+      "ImageRepositoryType": "ECR",
+      "ImageConfiguration": {
+        "Port": "8000",
+        "RuntimeEnvironmentVariables": {
+          "PORT": "8000",
+          "CAREERVOICE_API_URL": "https://careervoice.pathwisse.com"
+        }
+      }
+    },
+    "AuthenticationConfiguration": {
+      "AccessRoleArn": "<APPRUNNER_ECR_ACCESS_ROLE_ARN>"
+    },
+    "AutoDeploymentsEnabled": false
+  },
+  "InstanceConfiguration": {
+    "Cpu": "1024",
+    "Memory": "2048"
+  },
+  "HealthCheckConfiguration": {
+    "Protocol": "HTTP",
+    "Path": "/health",
+    "Interval": 10,
+    "Timeout": 5,
+    "HealthyThreshold": 1,
+    "UnhealthyThreshold": 5
+  },
+  "AutoScalingConfigurationArn": "<AUTOSCALING_CONFIGURATION_ARN>"
+}

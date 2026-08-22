@@ -1,0 +1,9 @@
+# Core Pipecat & Realtime Voice SDK
+pipecat-ai[daily,deepgram,cartesia,google,anthropic,openai]>=0.0.45
+aiohttp>=3.9.5
+pydantic>=2.7.0
+loguru>=0.7.2
+python-dotenv>=1.0.1
+requests>=2.31.0
+uvicorn>=0.30.0
+fastapi>=0.111.0
