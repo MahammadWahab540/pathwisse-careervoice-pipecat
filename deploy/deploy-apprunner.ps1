@@ -85,14 +85,46 @@ if (-not $AutoscalingArn) {
 }
 Write-Host "Autoscaling Config ARN: $AutoscalingArn"
 
-Write-Host "=== 7. Deploying / Updating App Runner Service ===" -ForegroundColor Cyan
+Write-Host "=== 7. Deploying / Updating App Runner Service with Secrets ===" -ForegroundColor Cyan
 $ServiceArn = (aws apprunner list-services --region $Region --query "ServiceSummaryList[?ServiceName=='$ServiceName'].ServiceArn | [0]" --output text).Trim()
+
+$SourceConfig = "{
+  `"ImageRepository`": {
+    `"ImageIdentifier`": `"$EcrUri:$GitSha`",
+    `"ImageRepositoryType`": `"ECR`",
+    `"ImageConfiguration`": {
+      `"Port`": `"8000`",
+      `"RuntimeEnvironmentVariables`": {
+        `"CAREERVOICE_API_URL`": `"https://careervoice.pathwisse.com`",
+        `"VOICE_TRANSPORT_DEFAULT`": `"daily`",
+        `"VOICE_TRANSPORT_FALLBACK`": `"livekit`",
+        `"GEMINI_MODEL`": `"gemini-3.6-flash`"
+      },
+      `"RuntimeEnvironmentSecrets`": {
+        `"DAILY_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/daily-api-key`",
+        `"LIVEKIT_URL`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/livekit-url`",
+        `"LIVEKIT_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/livekit-api-key`",
+        `"LIVEKIT_API_SECRET`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/livekit-api-secret`",
+        `"DEEPGRAM_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/deepgram-api-key`",
+        `"CARTESIA_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/cartesia-api-key`",
+        `"GEMINI_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/gemini-api-key`",
+        `"ANTHROPIC_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/anthropic-api-key`",
+        `"OPENAI_API_KEY`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/openai-api-key`",
+        `"CAREERVOICE_SERVICE_TOKEN`": `"arn:aws:secretsmanager:${Region}:${AccountId}:secret:careervoice/service-token`"
+      }
+    }
+  },
+  `"AuthenticationConfiguration`": {
+    `"AccessRoleArn`": `"$AccessRoleArn`"
+  },
+  `"AutoDeploymentsEnabled`": false
+}"
 
 if ($ServiceArn -eq "None" -or -not $ServiceArn) {
   Write-Host "Creating new App Runner service: $ServiceName..."
   $ServiceArn = (aws apprunner create-service `
     --service-name $ServiceName `
-    --source-configuration "{`"ImageRepository`":{`"ImageIdentifier`":`"$EcrUri:$GitSha`",`"ImageRepositoryType`":`"ECR`",`"ImageConfiguration`":{`"Port`":`"8000`",`"RuntimeEnvironmentVariables`":{`"PORT`":`"8000`",`"CAREERVOICE_API_URL`":`"https://careervoice.pathwisse.com`",`"VOICE_TRANSPORT_DEFAULT`":`"daily`",`"VOICE_TRANSPORT_FALLBACK`":`"livekit`",`"GEMINI_MODEL`":`"gemini-2.0-flash`"}}},`"AuthenticationConfiguration`":{`"AccessRoleArn`":`"$AccessRoleArn`"},`"AutoDeploymentsEnabled`":false}" `
+    --source-configuration $SourceConfig `
     --instance-configuration "{\`"Cpu\`":\`"1024\`",\`"Memory\`":\`"2048\`",\`"InstanceRoleArn\`":\`"$RuntimeRoleArn\`"}" `
     --health-check-configuration "{\`"Protocol\`":\`"HTTP\`",\`"Path\`":\`"/health\`",\`"Interval\`":10,\`"Timeout\`":5,\`"HealthyThreshold\`":1,\`"UnhealthyThreshold\`":5}" `
     --auto-scaling-configuration-arn $AutoscalingArn `
@@ -102,7 +134,8 @@ if ($ServiceArn -eq "None" -or -not $ServiceArn) {
   Write-Host "Updating existing App Runner service: $ServiceName..."
   aws apprunner update-service `
     --service-arn $ServiceArn `
-    --source-configuration "{`"ImageRepository`":{`"ImageIdentifier`":`"$EcrUri:$GitSha`",`"ImageRepositoryType`":`"ECR`",`"ImageConfiguration`":{`"Port`":`"8000`"}}}" `
+    --source-configuration $SourceConfig `
+    --instance-configuration "{\`"InstanceRoleArn\`":\`"$RuntimeRoleArn\`"}" `
     --region $Region
 }
 
@@ -114,8 +147,8 @@ while ($true) {
   Write-Host "Current Status: $Status"
   if ($Status -eq "RUNNING") {
     break
-  } elseif ($Status -eq "CREATE_FAILED") {
-    Write-Error "App Runner creation failed. Please inspect CloudWatch logs."
+  } elseif ($Status -eq "CREATE_FAILED" -or $Status -eq "OPERATION_FAILED") {
+    Write-Error "App Runner deployment failed. Inspect CloudWatch logs."
     exit 1
   }
   Start-Sleep -Seconds 15
@@ -124,6 +157,18 @@ while ($true) {
 $ServiceUrl = (aws apprunner describe-service --service-arn $ServiceArn --region $Region --query "Service.ServiceUrl" --output text).Trim()
 Write-Host "=== App Runner Deployment Succeeded ===" -ForegroundColor Green
 Write-Host "Service URL: https://$ServiceUrl"
-Write-Host "Health Check: https://$ServiceUrl/health"
-Write-Host "Readiness Check: https://$ServiceUrl/ready"
-Invoke-RestMethod -Uri "https://$ServiceUrl/health"
+
+Write-Host "Validating /health..."
+$HealthRes = Invoke-WebRequest -Uri "https://$ServiceUrl/health" -UseBasicParsing
+if ($HealthRes.StatusCode -ne 200) {
+  Write-Error "/health failed with status $($HealthRes.StatusCode)"
+}
+Write-Host "✓ /health returned 200"
+
+Write-Host "Validating /ready..."
+try {
+  $ReadyRes = Invoke-WebRequest -Uri "https://$ServiceUrl/ready" -UseBasicParsing
+  Write-Host "✓ /ready returned $($ReadyRes.StatusCode)"
+} catch {
+  Write-Warning "/ready returned error or 503 (check Secrets Manager credentials)"
+}

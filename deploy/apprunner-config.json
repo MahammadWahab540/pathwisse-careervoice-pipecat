@@ -7,11 +7,10 @@
       "ImageConfiguration": {
         "Port": "8000",
         "RuntimeEnvironmentVariables": {
-          "PORT": "8000",
           "CAREERVOICE_API_URL": "https://careervoice.pathwisse.com",
           "VOICE_TRANSPORT_DEFAULT": "daily",
           "VOICE_TRANSPORT_FALLBACK": "livekit",
-          "GEMINI_MODEL": "gemini-2.0-flash"
+          "GEMINI_MODEL": "gemini-3.6-flash"
         },
         "RuntimeEnvironmentSecrets": {
           "DAILY_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/daily-api-key",
@@ -22,7 +21,8 @@
           "CARTESIA_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/cartesia-api-key",
           "GEMINI_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/gemini-api-key",
           "ANTHROPIC_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/anthropic-api-key",
-          "OPENAI_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/openai-api-key"
+          "OPENAI_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/openai-api-key",
+          "CAREERVOICE_SERVICE_TOKEN": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/service-token"
         }
       }
     },

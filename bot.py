@@ -28,7 +28,7 @@ CAREERVOICE_API_URL = os.getenv("CAREERVOICE_API_URL", "http://localhost:5000").
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
@@ -72,35 +72,40 @@ async def notify_careervoice_signal(
 
 def create_llm_service(provider_preference: str = "gemini"):
     """
-    Instantiates the appropriate LLM service with fallback capability.
-    Order of preference:
-    1. Google Gemini (configured model via GEMINI_MODEL)
+    Instantiates the configured LLM provider service.
+    Order of selection:
+    1. Google Gemini (configured model via GEMINI_MODEL, defaults to gemini-3.6-flash)
     2. Anthropic Claude 3.5 Sonnet
     3. OpenAI GPT-4o-mini
     """
-    if GEMINI_API_KEY and provider_preference == "gemini":
-        logger.info("Initializing Google Gemini as Primary LLM", model=GEMINI_MODEL)
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
+    anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    if gemini_key and provider_preference == "gemini":
+        logger.info("Initializing Google Gemini as Primary LLM", model=gemini_model)
         return GoogleLLMService(
-            api_key=GEMINI_API_KEY,
-            model=GEMINI_MODEL,
+            api_key=gemini_key,
+            model=gemini_model,
         )
-    elif ANTHROPIC_API_KEY:
+    elif anthropic_key:
         logger.info("Initializing Anthropic Claude as LLM", model="claude-3-5-sonnet-20241022")
         return AnthropicLLMService(
-            api_key=ANTHROPIC_API_KEY,
+            api_key=anthropic_key,
             model="claude-3-5-sonnet-20241022",
         )
-    elif OPENAI_API_KEY:
+    elif openai_key:
         logger.info("Initializing OpenAI GPT-4o-mini as LLM", model="gpt-4o-mini")
         return OpenAILLMService(
-            api_key=OPENAI_API_KEY,
+            api_key=openai_key,
             model="gpt-4o-mini",
         )
-    elif GEMINI_API_KEY:
-        logger.info("Initializing Google Gemini fallback", model=GEMINI_MODEL)
+    elif gemini_key:
+        logger.info("Initializing Google Gemini fallback", model=gemini_model)
         return GoogleLLMService(
-            api_key=GEMINI_API_KEY,
-            model=GEMINI_MODEL,
+            api_key=gemini_key,
+            model=gemini_model,
         )
     else:
         raise RuntimeError(

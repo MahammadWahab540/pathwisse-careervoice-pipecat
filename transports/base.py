@@ -4,10 +4,13 @@ from typing import Optional, Dict, Any
 from pydantic import BaseModel, Field
 
 
-def sanitize_identifier(value: str) -> str:
+def sanitize_identifier(value: str, max_len: int = 64) -> str:
     """Sanitizes an identifier (e.g. auditId) to be safe for WebRTC room and participant names."""
+    if not value or not isinstance(value, str):
+        return "session"
     sanitized = re.sub(r"[^a-zA-Z0-9_-]", "-", value.strip())
-    return sanitized[:64] if sanitized else "session"
+    truncated = sanitized[:max_len].strip("-")
+    return truncated if truncated else "session"
 
 
 class SessionProvisionResult(BaseModel):

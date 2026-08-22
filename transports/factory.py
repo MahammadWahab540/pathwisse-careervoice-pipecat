@@ -45,12 +45,14 @@ class TransportRouter:
         requested_transport: Optional[str] = None,
     ) -> Tuple[SessionProvisionResult, VoiceTransportProvider]:
         """
-        Attempts to provision a voice session with pre-session failover.
-        Order:
-        1. Explicitly requested transport OR default transport.
-        2. If primary fails, attempts fallback transport if configured and different from primary.
+        Provisions a voice session according to the deterministic transport policy:
+        1. If caller explicitly requested a transport ('daily' or 'livekit'), use STRICT mode.
+           Failure on explicit request raises an error immediately (no silent provider switching).
+        2. If caller omitted transport (or passed 'auto'), use DEFAULT transport with automatic
+           fallback to FALLBACK transport on provisioning errors.
         """
-        primary_name = (requested_transport or self.default_transport).strip().lower()
+        is_explicit = bool(requested_transport and requested_transport.strip().lower() not in ("auto", "default", ""))
+        primary_name = (requested_transport if is_explicit else self.default_transport).strip().lower()
         fallback_name = self.fallback_transport
 
         if primary_name not in self._providers:
@@ -63,6 +65,7 @@ class TransportRouter:
             audit_id=audit_id,
             requested_transport=requested_transport or "auto",
             selected_primary=primary_name,
+            mode="strict" if is_explicit else "failover_enabled",
             target_role=target_role,
         )
 
@@ -81,7 +84,13 @@ class TransportRouter:
                 error=str(primary_error),
             )
 
-            # Determine if fallback can be attempted
+            # In strict mode, do not fail over silently
+            if is_explicit:
+                raise RuntimeError(
+                    f"Explicitly requested transport '{primary_name}' failed to provision: {primary_error}"
+                ) from primary_error
+
+            # Automatic failover path for default / auto mode
             if fallback_name and fallback_name != primary_name and fallback_name in self._providers:
                 fallback_provider = self._providers[fallback_name]
                 if fallback_provider.is_configured():

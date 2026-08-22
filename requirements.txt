@@ -1,13 +1,14 @@
-# Core Pipecat Multi-Model & Multi-Transport Engine
-pipecat-ai[daily,livekit,deepgram,cartesia,google,anthropic,openai]>=0.0.45
-livekit>=0.17.0
-livekit-api>=0.7.0
-aiohttp>=3.9.5
-pydantic>=2.7.0
-loguru>=0.7.2
-python-dotenv>=1.0.1
-requests>=2.31.0
-uvicorn>=0.30.0
-fastapi>=0.111.0
-pytest>=8.2.0
-pytest-asyncio>=0.23.0
+# Core Pipecat Multi-Model & Multi-Transport Engine (Pinned for Production Determinism)
+pipecat-ai[daily,livekit,deepgram,cartesia,google,anthropic,openai]==0.0.45
+livekit==0.17.4
+livekit-api==0.7.2
+aiohttp==3.9.5
+pydantic==2.7.4
+loguru==0.7.2
+python-dotenv==1.0.1
+requests==2.31.0
+uvicorn==0.30.1
+fastapi==0.111.0
+pytest==8.2.2
+pytest-asyncio==0.23.7
+httpx==0.27.0

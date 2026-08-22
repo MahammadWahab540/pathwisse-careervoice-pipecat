@@ -121,33 +121,46 @@ if [ -z "$AUTOSCALING_ARN" ]; then
 fi
 echo "Autoscaling Config ARN: ${AUTOSCALING_ARN}"
 
-echo "=== 7. Deploying / Updating App Runner Service ==="
+echo "=== 7. Deploying / Updating App Runner Service with Secrets ==="
 SERVICE_ARN=$(aws apprunner list-services --region "${REGION}" --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn | [0]" --output text)
+
+SOURCE_CONFIG="{
+  \"ImageRepository\": {
+    \"ImageIdentifier\": \"${ECR_URI}:${GIT_SHA}\",
+    \"ImageRepositoryType\": \"ECR\",
+    \"ImageConfiguration\": {
+      \"Port\": \"8000\",
+      \"RuntimeEnvironmentVariables\": {
+        \"CAREERVOICE_API_URL\": \"https://careervoice.pathwisse.com\",
+        \"VOICE_TRANSPORT_DEFAULT\": \"daily\",
+        \"VOICE_TRANSPORT_FALLBACK\": \"livekit\",
+        \"GEMINI_MODEL\": \"gemini-3.6-flash\"
+      },
+      \"RuntimeEnvironmentSecrets\": {
+        \"DAILY_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/daily-api-key\",
+        \"LIVEKIT_URL\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/livekit-url\",
+        \"LIVEKIT_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/livekit-api-key\",
+        \"LIVEKIT_API_SECRET\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/livekit-api-secret\",
+        \"DEEPGRAM_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/deepgram-api-key\",
+        \"CARTESIA_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/cartesia-api-key\",
+        \"GEMINI_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/gemini-api-key\",
+        \"ANTHROPIC_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/anthropic-api-key\",
+        \"OPENAI_API_KEY\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/openai-api-key\",
+        \"CAREERVOICE_SERVICE_TOKEN\": \"arn:aws:secretsmanager:${REGION}:${ACCOUNT_ID}:secret:careervoice/service-token\"
+      }
+    }
+  },
+  \"AuthenticationConfiguration\": {
+    \"AccessRoleArn\": \"${ACCESS_ROLE_ARN}\"
+  },
+  \"AutoDeploymentsEnabled\": false
+}"
 
 if [ "$SERVICE_ARN" == "None" ] || [ -z "$SERVICE_ARN" ]; then
   echo "Creating new App Runner service: ${SERVICE_NAME}..."
   SERVICE_ARN=$(aws apprunner create-service \
     --service-name "${SERVICE_NAME}" \
-    --source-configuration "{
-      \"ImageRepository\": {
-        \"ImageIdentifier\": \"${ECR_URI}:${GIT_SHA}\",
-        \"ImageRepositoryType\": \"ECR\",
-        \"ImageConfiguration\": {
-          \"Port\": \"8000\",
-          \"RuntimeEnvironmentVariables\": {
-            \"PORT\": \"8000\",
-            \"CAREERVOICE_API_URL\": \"https://careervoice.pathwisse.com\",
-            \"VOICE_TRANSPORT_DEFAULT\": \"daily\",
-            \"VOICE_TRANSPORT_FALLBACK\": \"livekit\",
-            \"GEMINI_MODEL\": \"gemini-2.0-flash\"
-          }
-        }
-      },
-      \"AuthenticationConfiguration\": {
-        \"AccessRoleArn\": \"${ACCESS_ROLE_ARN}\"
-      },
-      \"AutoDeploymentsEnabled\": false
-    }" \
+    --source-configuration "${SOURCE_CONFIG}" \
     --instance-configuration "{\"Cpu\": \"1024\", \"Memory\": \"2048\", \"InstanceRoleArn\": \"${RUNTIME_ROLE_ARN}\"}" \
     --health-check-configuration "{\"Protocol\": \"HTTP\", \"Path\": \"/health\", \"Interval\": 10, \"Timeout\": 5, \"HealthyThreshold\": 1, \"UnhealthyThreshold\": 5}" \
     --auto-scaling-configuration-arn "${AUTOSCALING_ARN}" \
@@ -157,15 +170,8 @@ else
   echo "Updating existing App Runner service: ${SERVICE_NAME}..."
   aws apprunner update-service \
     --service-arn "${SERVICE_ARN}" \
-    --source-configuration "{
-      \"ImageRepository\": {
-        \"ImageIdentifier\": \"${ECR_URI}:${GIT_SHA}\",
-        \"ImageRepositoryType\": \"ECR\",
-        \"ImageConfiguration\": {
-          \"Port\": \"8000\"
-        }
-      }
-    }" \
+    --source-configuration "${SOURCE_CONFIG}" \
+    --instance-configuration "{\"InstanceRoleArn\": \"${RUNTIME_ROLE_ARN}\"}" \
     --region "${REGION}"
 fi
 
@@ -177,16 +183,31 @@ while true; do
   echo "Current Status: ${STATUS}"
   if [ "$STATUS" == "RUNNING" ]; then
     break
-  elif [ "$STATUS" == "CREATE_FAILED" ]; then
-    echo "App Runner service creation failed. Inspect AWS logs."
+  elif [ "$STATUS" == "CREATE_FAILED" ] || [ "$STATUS" == "OPERATION_FAILED" ]; then
+    echo "App Runner service operation failed. Inspect AWS CloudWatch logs."
     exit 1
   fi
   sleep 15
 done
 
 SERVICE_URL=$(aws apprunner describe-service --service-arn "${SERVICE_ARN}" --region "${REGION}" --query "Service.ServiceUrl" --output text)
-echo "=== App Runner Deployment Succeeded ==="
+echo "=== App Runner Deployment Reached RUNNING ==="
 echo "Service URL: https://${SERVICE_URL}"
-echo "Health Check: https://${SERVICE_URL}/health"
-echo "Readiness Check: https://${SERVICE_URL}/ready"
-curl -s "https://${SERVICE_URL}/health"
+
+echo "Validating /health endpoint..."
+HEALTH_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://${SERVICE_URL}/health")
+if [ "$HEALTH_CODE" != "200" ]; then
+  echo "ERROR: /health check returned HTTP ${HEALTH_CODE} (expected 200)"
+  exit 1
+fi
+echo "✓ /health returned HTTP 200"
+
+echo "Validating /ready endpoint..."
+READY_CODE=$(curl -s -o /dev/null -w "%{http_code}" "https://${SERVICE_URL}/ready")
+if [ "$READY_CODE" != "200" ]; then
+  echo "WARNING: /ready check returned HTTP ${READY_CODE}. Check configured secrets in Secrets Manager."
+else
+  echo "✓ /ready returned HTTP 200"
+fi
+
+echo "=== Deployment Completed Successfully ==="

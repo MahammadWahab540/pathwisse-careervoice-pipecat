@@ -1,3 +1,4 @@
+import os
 import pytest
 import asyncio
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -14,6 +15,7 @@ from transports.livekit_transport import (
     generate_livekit_token,
 )
 from transports.factory import TransportRouter
+from bot import create_llm_service
 from server import app
 
 client = TestClient(app)
@@ -26,10 +28,34 @@ def test_sanitize_identifier():
     assert sanitize_identifier("audit_123-abc") == "audit_123-abc"
     assert sanitize_identifier("audit/123@#$xyz") == "audit-123---xyz"
     assert sanitize_identifier("") == "session"
+    assert len(sanitize_identifier("a" * 100, max_len=64)) <= 64
 
 
 # ==============================================================================
-# 2. Daily Transport Provider Tests
+# 2. Gemini Model Selection & Configuration Tests
+# ==============================================================================
+def test_gemini_model_configuration():
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "fake-key", "GEMINI_MODEL": "gemini-3.6-flash"}):
+        with patch("bot.GoogleLLMService") as mock_google_llm:
+            create_llm_service("gemini")
+            mock_google_llm.assert_called_once_with(
+                api_key="fake-key",
+                model="gemini-3.6-flash",
+            )
+
+
+def test_gemini_model_custom_override():
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "fake-key", "GEMINI_MODEL": "custom-gemini-model"}):
+        with patch("bot.GoogleLLMService") as mock_google_llm:
+            create_llm_service("gemini")
+            mock_google_llm.assert_called_once_with(
+                api_key="fake-key",
+                model="custom-gemini-model",
+            )
+
+
+# ==============================================================================
+# 3. Daily Transport Provider Tests
 # ==============================================================================
 @pytest.mark.asyncio
 async def test_daily_provision_session_success():
@@ -64,7 +90,7 @@ async def test_daily_provision_session_success():
 
 
 # ==============================================================================
-# 3. LiveKit Transport Provider Tests
+# 4. LiveKit Transport Provider Tests
 # ==============================================================================
 @pytest.mark.asyncio
 async def test_livekit_provision_session_success():
@@ -94,60 +120,32 @@ async def test_livekit_provision_session_success():
 
 
 # ==============================================================================
-# 4. Transport Router & Pre-Session Failover Tests
+# 5. Transport Router & Strict vs Failover Policy Tests
 # ==============================================================================
 @pytest.mark.asyncio
-async def test_router_explicit_daily():
-    router = TransportRouter()
-    mock_daily = MagicMock()
-    mock_daily.is_configured.return_value = True
-    mock_daily.provision_session = AsyncMock(
-        return_value=SessionProvisionResult(
-            provider="daily",
-            audit_id="a1",
-            room_url="https://daily.co/r1",
-            room_name="r1",
-            student_token="st1",
-            bot_token="bt1",
-            connection_url="https://daily.co/r1",
-        )
-    )
-    router._providers["daily"] = mock_daily
-
-    res, prov = await router.provision_session_with_failover("a1", "DevOps", requested_transport="daily")
-    assert res.provider == "daily"
-    assert prov == mock_daily
-
-
-@pytest.mark.asyncio
-async def test_router_explicit_livekit():
-    router = TransportRouter()
-    mock_livekit = MagicMock()
-    mock_livekit.is_configured.return_value = True
-    mock_livekit.provision_session = AsyncMock(
-        return_value=SessionProvisionResult(
-            provider="livekit",
-            audit_id="a2",
-            room_url="wss://livekit.cloud",
-            room_name="careervoice-a2",
-            student_token="st2",
-            bot_token="bt2",
-            connection_url="wss://livekit.cloud",
-        )
-    )
-    router._providers["livekit"] = mock_livekit
-
-    res, prov = await router.provision_session_with_failover("a2", "DevOps", requested_transport="livekit")
-    assert res.provider == "livekit"
-    assert prov == mock_livekit
-
-
-@pytest.mark.asyncio
-async def test_router_failover_daily_to_livekit():
+async def test_router_strict_explicit_daily_failure_raises_error():
     router = TransportRouter()
     mock_daily = MagicMock()
     mock_daily.is_configured.return_value = True
     mock_daily.provision_session = AsyncMock(side_effect=RuntimeError("Daily API rate limited"))
+
+    mock_livekit = MagicMock()
+    mock_livekit.is_configured.return_value = True
+
+    router._providers["daily"] = mock_daily
+    router._providers["livekit"] = mock_livekit
+
+    # Explicit 'daily' must NOT silently switch to livekit in strict mode
+    with pytest.raises(RuntimeError, match="Explicitly requested transport 'daily' failed"):
+        await router.provision_session_with_failover("a1", "DevOps", requested_transport="daily")
+
+
+@pytest.mark.asyncio
+async def test_router_auto_failover_daily_to_livekit():
+    router = TransportRouter()
+    mock_daily = MagicMock()
+    mock_daily.is_configured.return_value = True
+    mock_daily.provision_session = AsyncMock(side_effect=RuntimeError("Daily down"))
 
     mock_livekit = MagicMock()
     mock_livekit.is_configured.return_value = True
@@ -166,8 +164,8 @@ async def test_router_failover_daily_to_livekit():
     router._providers["daily"] = mock_daily
     router._providers["livekit"] = mock_livekit
 
-    # Request daily, daily fails, fallback to livekit
-    res, prov = await router.provision_session_with_failover("a3", "ML Engineer", requested_transport="daily")
+    # Omitted requested transport (auto mode) -> failover permitted
+    res, prov = await router.provision_session_with_failover("a3", "ML Engineer", requested_transport=None)
     assert res.provider == "livekit"
     assert prov == mock_livekit
 
@@ -187,38 +185,108 @@ async def test_router_both_fail_raises_runtime_error():
     router._providers["livekit"] = mock_livekit
 
     with pytest.raises(RuntimeError, match="Both primary transport .* failed"):
-        await router.provision_session_with_failover("a4", "Cybersecurity", requested_transport="daily")
+        await router.provision_session_with_failover("a4", "Cybersecurity", requested_transport=None)
 
 
 # ==============================================================================
-# 5. API Endpoints Tests
+# 6. Service Token Authentication Tests
 # ==============================================================================
-def test_api_health_endpoint():
-    response = client.get("/health")
-    assert response.status_code == 200
-    data = response.json()
-    assert data["status"] == "healthy"
-    assert "daily" in data["transports"]
-    assert "livekit" in data["transports"]
+def test_auth_missing_token_returns_401():
+    with patch.dict(os.environ, {"CAREERVOICE_SERVICE_TOKEN": "secret-token-xyz-123"}):
+        response = client.post(
+            "/api/voice/session",
+            json={"auditId": "test_auth", "targetRole": "Engineer"},
+        )
+        assert response.status_code == 401
+        assert "Missing Authorization" in response.json()["detail"]
 
 
-def test_api_ready_endpoint():
-    response = client.get("/ready")
-    assert response.status_code == 200
-    data = response.json()
-    assert "transports" in data
-    assert "daily" in data["transports"]
-    assert "livekit" in data["transports"]
-    assert "providers" in data
+def test_auth_invalid_token_returns_401():
+    with patch.dict(os.environ, {"CAREERVOICE_SERVICE_TOKEN": "secret-token-xyz-123"}):
+        response = client.post(
+            "/api/voice/session",
+            json={"auditId": "test_auth", "targetRole": "Engineer"},
+            headers={"Authorization": "Bearer wrong-token-456"},
+        )
+        assert response.status_code == 401
+        assert "Invalid service token" in response.json()["detail"]
 
 
-def test_api_start_session_validation_error():
+def test_auth_valid_token_accepted():
+    with patch.dict(os.environ, {"CAREERVOICE_SERVICE_TOKEN": "secret-token-xyz-123"}):
+        with patch(
+            "transports.factory.router.provision_session_with_failover",
+            new_callable=AsyncMock,
+            return_value=(
+                SessionProvisionResult(
+                    provider="daily",
+                    audit_id="test_auth_ok",
+                    room_url="https://daily.co/r",
+                    room_name="r",
+                    student_token="st",
+                    bot_token="bt",
+                    connection_url="https://daily.co/r",
+                ),
+                MagicMock(),
+            ),
+        ):
+            response = client.post(
+                "/api/voice/session",
+                json={"auditId": "test_auth_ok", "targetRole": "Engineer"},
+                headers={"Authorization": "Bearer secret-token-xyz-123"},
+            )
+            assert response.status_code == 200
+            assert response.json()["success"] is True
+
+
+# ==============================================================================
+# 7. Backward Compatibility Tests (Pre-provisioned Daily Room)
+# ==============================================================================
+def test_backward_compatibility_pre_provisioned_room():
     response = client.post(
         "/api/voice/session",
         json={
-            "auditId": "test_bad",
-            "targetRole": "Engineer",
-            "transport": "unsupported_transport_xyz",
+            "auditId": "legacy_audit",
+            "targetRole": "Frontend Developer",
+            "roomUrl": "https://careervoice.daily.co/legacy-room",
+            "token": "legacy-token-789",
         },
     )
-    assert response.status_code == 400
+    assert response.status_code == 200
+    data = response.json()
+    assert data["provider"] == "daily"
+    assert data["roomUrl"] == "https://careervoice.daily.co/legacy-room"
+    assert data["token"] == "legacy-token-789"
+    assert data["connection"]["url"] == "https://careervoice.daily.co/legacy-room"
+
+
+# ==============================================================================
+# 8. Readiness Semantics Tests (200 vs 503)
+# ==============================================================================
+def test_readiness_not_ready_returns_503():
+    with patch.dict(os.environ, {}, clear=True):
+        response = client.get("/ready")
+        assert response.status_code == 503
+        data = response.json()
+        assert data["status"] == "not_ready"
+        assert data["providers"]["deepgram"] is False
+
+
+def test_readiness_ready_returns_200():
+    ready_env = {
+        "DAILY_API_KEY": "daily-key-123",
+        "DEEPGRAM_API_KEY": "deepgram-key-123",
+        "CARTESIA_API_KEY": "cartesia-key-123",
+        "GEMINI_API_KEY": "gemini-key-123",
+    }
+    with patch.dict(os.environ, ready_env):
+        with patch.object(
+            DailyVoiceTransportProvider, "is_configured", return_value=True
+        ):
+            response = client.get("/ready")
+            assert response.status_code == 200
+            data = response.json()
+            assert data["status"] == "ready"
+            assert data["providers"]["deepgram"] is True
+            assert data["providers"]["cartesia"] is True
+            assert data["providers"]["llm"] is True

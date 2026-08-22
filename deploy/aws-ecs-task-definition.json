@@ -23,7 +23,7 @@
         { "name": "CAREERVOICE_API_URL", "value": "https://careervoice.pathwisse.com" },
         { "name": "VOICE_TRANSPORT_DEFAULT", "value": "daily" },
         { "name": "VOICE_TRANSPORT_FALLBACK", "value": "livekit" },
-        { "name": "GEMINI_MODEL", "value": "gemini-2.0-flash" }
+        { "name": "GEMINI_MODEL", "value": "gemini-3.6-flash" }
       ],
       "secrets": [
         { "name": "DAILY_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/daily-api-key" },
@@ -34,7 +34,8 @@
         { "name": "CARTESIA_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/cartesia-api-key" },
         { "name": "GEMINI_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/gemini-api-key" },
         { "name": "ANTHROPIC_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/anthropic-api-key" },
-        { "name": "OPENAI_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/openai-api-key" }
+        { "name": "OPENAI_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/openai-api-key" },
+        { "name": "CAREERVOICE_SERVICE_TOKEN", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/service-token" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
