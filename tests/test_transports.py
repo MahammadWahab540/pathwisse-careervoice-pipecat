@@ -189,6 +189,40 @@ async def test_router_both_fail_raises_runtime_error():
         await router.provision_session_with_failover("a4", "Cybersecurity", requested_transport=None)
 
 
+def test_router_dynamic_daily_configured_from_env():
+    """Transport router dynamically detects Daily credentials from environment without restarting."""
+    from transports.factory import router
+    with patch.dict(os.environ, {"DAILY_API_KEY": "test-env-daily-key"}, clear=True):
+        assert router.get_provider("daily").is_configured() is True
+        readiness = router.get_readiness_status()
+        assert readiness["daily"]["configured"] is True
+
+
+def test_router_dynamic_livekit_configured_from_env():
+    """Transport router dynamically detects complete LiveKit credentials from environment."""
+    from transports.factory import router
+    livekit_env = {
+        "LIVEKIT_URL": "wss://test.livekit.cloud",
+        "LIVEKIT_API_KEY": "test-key",
+        "LIVEKIT_API_SECRET": "test-secret",
+    }
+    with patch.dict(os.environ, livekit_env, clear=True):
+        assert router.get_provider("livekit").is_configured() is True
+        readiness = router.get_readiness_status()
+        assert readiness["livekit"]["configured"] is True
+
+
+def test_router_dynamic_env_mutation_updates_configured_state():
+    """Mutating environment variables at runtime updates provider configured state immediately."""
+    from transports.factory import router
+    with patch.dict(os.environ, {}, clear=True):
+        assert router.get_provider("daily").is_configured() is False
+        assert router.get_provider("livekit").is_configured() is False
+
+    with patch.dict(os.environ, {"DAILY_API_KEY": "dynamic-key"}):
+        assert router.get_provider("daily").is_configured() is True
+
+
 # ==============================================================================
 # 6. Service Token Authentication & Production Fail-Closed Tests
 # ==============================================================================

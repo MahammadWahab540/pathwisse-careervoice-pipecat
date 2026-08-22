@@ -1,6 +1,6 @@
 import os
 from datetime import timedelta
-from typing import Any, Tuple
+from typing import Any, Tuple, Optional
 from loguru import logger
 
 from .base import VoiceTransportProvider, SessionProvisionResult, VoiceSessionConfig, sanitize_identifier
@@ -69,7 +69,7 @@ def generate_livekit_token(
 
 
 class LiveKitVoiceTransportProvider(VoiceTransportProvider):
-    """LiveKit WebRTC Transport Provider implementation."""
+    """LiveKit WebRTC Transport Provider implementation with dynamic credential evaluation."""
 
     def __init__(
         self,
@@ -77,16 +77,28 @@ class LiveKitVoiceTransportProvider(VoiceTransportProvider):
         api_key: str = "",
         api_secret: str = "",
     ):
-        self._url = url or os.getenv("LIVEKIT_URL", "").strip()
-        self._api_key = api_key or os.getenv("LIVEKIT_API_KEY", "").strip()
-        self._api_secret = api_secret or os.getenv("LIVEKIT_API_SECRET", "").strip()
+        self._explicit_url = url
+        self._explicit_api_key = api_key
+        self._explicit_api_secret = api_secret
+
+    @property
+    def url(self) -> str:
+        return self._explicit_url if self._explicit_url else os.getenv("LIVEKIT_URL", "").strip()
+
+    @property
+    def api_key(self) -> str:
+        return self._explicit_api_key if self._explicit_api_key else os.getenv("LIVEKIT_API_KEY", "").strip()
+
+    @property
+    def api_secret(self) -> str:
+        return self._explicit_api_secret if self._explicit_api_secret else os.getenv("LIVEKIT_API_SECRET", "").strip()
 
     @property
     def name(self) -> str:
         return "livekit"
 
     def is_configured(self) -> bool:
-        return bool(self._url and self._api_key and self._api_secret)
+        return bool(self.url and self.api_key and self.api_secret)
 
     async def provision_session(
         self,
@@ -106,8 +118,8 @@ class LiveKitVoiceTransportProvider(VoiceTransportProvider):
 
         # Generate scoped participant JWT for student
         student_token = generate_livekit_token(
-            api_key=self._api_key,
-            api_secret=self._api_secret,
+            api_key=self.api_key,
+            api_secret=self.api_secret,
             identity=student_identity,
             name=student_name,
             room_name=room_name,
@@ -115,8 +127,8 @@ class LiveKitVoiceTransportProvider(VoiceTransportProvider):
 
         # Generate scoped participant JWT for Qalam AI agent bot
         bot_token = generate_livekit_token(
-            api_key=self._api_key,
-            api_secret=self._api_secret,
+            api_key=self.api_key,
+            api_secret=self.api_secret,
             identity=bot_identity,
             name="Qalam - AI Career Auditor",
             room_name=room_name,
@@ -125,11 +137,11 @@ class LiveKitVoiceTransportProvider(VoiceTransportProvider):
         return SessionProvisionResult(
             provider="livekit",
             audit_id=audit_id,
-            room_url=self._url,
+            room_url=self.url,
             room_name=room_name,
             student_token=student_token,
             bot_token=bot_token,
-            connection_url=self._url,
+            connection_url=self.url,
             extra={
                 "studentIdentity": student_identity,
                 "botIdentity": bot_identity,

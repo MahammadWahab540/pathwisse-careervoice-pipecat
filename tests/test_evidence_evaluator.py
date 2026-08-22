@@ -598,3 +598,86 @@ async def test_audit_id_and_provenance_preserved_in_persistence():
             assert len(call_kwargs["source_turns"]) >= 1
 
             await evaluator.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_evaluation_tasks_cancelled_and_awaited_on_shutdown():
+    """All active evaluation tasks must be explicitly cancelled and awaited so no un-awaited tasks remain."""
+    evaluator = CareerVoiceEvidenceEvaluator(
+        audit_id="audit_eval_task_await",
+        target_role="Software Engineer",
+        student_name="Candidate",
+    )
+
+    eval_started = asyncio.Event()
+
+    async def hanging_eval(*args, **kwargs):
+        eval_started.set()
+        await asyncio.sleep(10.0)
+        return None
+
+    with patch("bot.evaluate_student_evidence_llm", side_effect=hanging_eval):
+        frame = LLMMessagesFrame(
+            messages=[{"role": "user", "content": "I built a distributed key-value store in Rust."}]
+        )
+        await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
+        await eval_started.wait()
+
+        # Capture actual task objects
+        captured_eval_tasks = list(evaluator._evaluation_tasks)
+        assert len(captured_eval_tasks) == 1
+        assert not captured_eval_tasks[0].done()
+
+        # Shutdown must cancel AND await the task
+        await evaluator.shutdown()
+
+        assert all(t.done() for t in captured_eval_tasks)
+        assert len(evaluator._evaluation_tasks) == 0
+        assert len(evaluator._persistence_tasks) == 0
+
+
+@pytest.mark.asyncio
+async def test_hanging_persistence_tasks_cancelled_and_awaited_on_shutdown():
+    """All hanging persistence tasks exceeding timeout must be explicitly cancelled and awaited."""
+    evaluator = CareerVoiceEvidenceEvaluator(
+        audit_id="audit_persist_task_await",
+        target_role="Backend Engineer",
+        student_name="Candidate",
+    )
+
+    assessment = EvidenceAssessment(
+        skillName="Kubernetes",
+        evidenceFound=True,
+        extractedLevel="Advanced",
+        confidenceScore=90,
+        evidenceStrength="strong",
+        evidenceSnippet="Deployed Kubernetes Helm charts with auto-scaling.",
+        requiresFollowUp=False,
+    )
+
+    persist_started = asyncio.Event()
+
+    async def hanging_persist(*args, **kwargs):
+        persist_started.set()
+        await asyncio.sleep(10.0)
+
+    with patch("bot.evaluate_student_evidence_llm", new_callable=AsyncMock, return_value=assessment):
+        with patch("bot.notify_careervoice_signal", side_effect=hanging_persist):
+            frame = LLMMessagesFrame(
+                messages=[{"role": "user", "content": "I deployed Kubernetes Helm charts with HPA auto-scaling."}]
+            )
+            await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
+            await persist_started.wait()
+
+            # Capture actual persistence task objects
+            captured_persist_tasks = list(evaluator._persistence_tasks)
+            assert len(captured_persist_tasks) == 1
+            assert not captured_persist_tasks[0].done()
+
+            # Shutdown with short grace period must cancel and await
+            await evaluator.shutdown(persistence_grace_seconds=0.1)
+
+            assert all(t.done() for t in captured_persist_tasks)
+            assert len(evaluator._evaluation_tasks) == 0
+            assert len(evaluator._persistence_tasks) == 0
+

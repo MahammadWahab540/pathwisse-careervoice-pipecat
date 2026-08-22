@@ -1,4 +1,9 @@
 import os
+from dotenv import load_dotenv
+
+# Load environment variables before importing transport routers or providers
+load_dotenv()
+
 import re
 import sys
 import json
@@ -8,7 +13,6 @@ from typing import Optional, Dict, Any, List, Set, Literal
 import aiohttp
 from pydantic import BaseModel, Field, model_validator, ValidationError
 from loguru import logger
-from dotenv import load_dotenv
 
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
@@ -26,8 +30,6 @@ from pipecat.processors.aggregators.llm_response import (
 )
 
 from transports import router, VoiceSessionConfig
-
-load_dotenv()
 
 CAREERVOICE_API_URL = os.getenv("CAREERVOICE_API_URL", "http://localhost:5000").rstrip("/")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
@@ -550,14 +552,18 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
     async def shutdown(self, persistence_grace_seconds: float = 2.5):
         """
         Graceful session shutdown:
-        1. Immediately cancels active evaluation tasks.
+        1. Immediately cancels active evaluation tasks and properly awaits their termination.
         2. Waits up to persistence_grace_seconds for pending persistence webhook tasks.
-        3. Cleans up all tracked task sets so zero orphan tasks remain.
+        3. Cancels and awaits any remaining persistence tasks exceeding timeout.
+        4. Cleans up all tracked task sets so zero orphan tasks remain.
         """
-        # 1. Cancel evaluation tasks immediately
-        for task in list(self._evaluation_tasks):
+        # 1. Cancel evaluation tasks immediately and await them
+        eval_tasks = list(self._evaluation_tasks)
+        for task in eval_tasks:
             if not task.done():
                 task.cancel()
+        if eval_tasks:
+            await asyncio.gather(*eval_tasks, return_exceptions=True)
         self._evaluation_tasks.clear()
 
         # 2. Wait for persistence tasks to complete within grace period
@@ -574,6 +580,7 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                     for t in unfinished:
                         if not t.done():
                             t.cancel()
+                    await asyncio.gather(*unfinished, return_exceptions=True)
             except Exception as e:
                 logger.warning("evidence_persistence_shutdown_error", error=str(e))
         self._persistence_tasks.clear()

@@ -7,10 +7,11 @@ from pydantic import BaseModel, Field
 from loguru import logger
 from dotenv import load_dotenv
 
+# Load environment variables before importing bot and transports singletons
+load_dotenv()
+
 from bot import run_careervoice_agent
 from transports import router, SessionProvisionResult, VoiceSessionConfig, sanitize_identifier
-
-load_dotenv()
 
 app = FastAPI(
     title="Pathwisse CareerVoice Pipecat Voice Server",
