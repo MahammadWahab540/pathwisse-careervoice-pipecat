@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import asyncio
 import time
 from typing import Optional, Dict, Any, List
@@ -43,7 +44,7 @@ async def notify_careervoice_signal(
     evidence_strength: str,
     raw_answer: str,
 ):
-    """Post extracted skill signals asynchronously back to CareerVoice backend."""
+    """Post verified skill evidence signal asynchronously back to CareerVoice backend."""
     try:
         async with aiohttp.ClientSession() as session:
             payload = {
@@ -82,16 +83,126 @@ async def notify_careervoice_signal(
         )
 
 
+async def evaluate_student_evidence_llm(
+    answer_text: str,
+    target_role: str,
+    conversation_history: Optional[List[Dict[str, str]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Evaluates candidate conversational answer using structured LLM analysis.
+    Distinguishes genuine, verifiable engineering evidence from weak claims / technology mentions.
+    
+    Returns structured dict or None if evaluation fails.
+    """
+    gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
+    gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+
+    prompt = f"""You are an expert technical interviewer and Career Assessment Evaluator for Pathwisse CareerVoice.
+Analyze the candidate's spoken response for concrete, verifiable engineering skill evidence for the role: "{target_role}".
+
+CANDIDATE RESPONSE:
+\"\"\"{answer_text}\"\"\"
+
+EVALUATION RULES:
+1. "I know <tech>", "I studied <tech>", "I worked with <tech>", or merely naming technologies without concrete implementation details is INSUFFICIENT evidence.
+2. Vague statements ("I made a website", "I did projects") without specific technical decisions, bugs solved, architecture, or code trade-offs is INSUFFICIENT evidence.
+3. Concrete evidence REQUIRES at least one of:
+   - What they specifically built and personally implemented
+   - Architecture or state-management decisions
+   - Concrete bugs, debugging methodology, or performance optimizations
+   - Technical trade-offs and code design decisions
+   - Measurable engineering outcomes
+4. NEVER infer competency from word count or generic keyword frequency.
+5. If concrete evidence IS found:
+   {{
+     "skillName": "Specific Skill Name (e.g. React, PostgreSQL, Docker, Python)",
+     "evidenceFound": true,
+     "extractedLevel": "Foundational" | "Intermediate" | "Advanced" | "Expert",
+     "confidenceScore": <integer 50-100 representing confidence in this evidence assessment>,
+     "evidenceStrength": "moderate" | "strong",
+     "evidenceSnippet": "concise quote demonstrating the skill",
+     "requiresFollowUp": false,
+     "followUpQuestion": null
+   }}
+6. If evidence is weak, generic, technology-name-only, or absent:
+   {{
+     "skillName": "Mentioned Tech or null",
+     "evidenceFound": false,
+     "extractedLevel": null,
+     "confidenceScore": null,
+     "evidenceStrength": "insufficient",
+     "evidenceSnippet": null,
+     "requiresFollowUp": true,
+     "followUpQuestion": "A targeted technical question probing what they personally built or debugged with that skill"
+   }}
+
+Return ONLY a valid JSON object matching the schema above."""
+
+    try:
+        if gemini_key:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "response_mime_type": "application/json",
+                },
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        candidates = data.get("candidates", [])
+                        if candidates:
+                            raw_content = candidates[0]["content"]["parts"][0]["text"]
+                            return json.loads(raw_content)
+                    else:
+                        logger.warning("gemini_evidence_eval_failed", status=resp.status)
+
+        elif openai_key:
+            url = "https://api.openai.com/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {openai_key}"}
+            payload = {
+                "model": "gpt-4o-mini",
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+                "messages": [{"role": "user", "content": prompt}],
+            }
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    headers=headers,
+                    json=payload,
+                    timeout=aiohttp.ClientTimeout(total=8),
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        raw_content = data["choices"][0]["message"]["content"]
+                        return json.loads(raw_content)
+    except Exception as e:
+        logger.warning("evidence_evaluation_error", error=str(e))
+        return None
+
+    return None
+
+
 class CareerVoiceEvidenceEvaluator(FrameProcessor):
     """
-    Evaluates candidate conversational responses in real-time within the Pipecat pipeline
-    and asynchronously persists structured skill signals to the CareerVoice backend.
+    Pipeline processor that analyzes student turns using LLM structured assessment.
+    Only persists signals when concrete evidence is proven (evidenceFound == true).
+    Never assigns scores based on word count, keyword mentions, or answer length.
     """
     def __init__(self, audit_id: str, target_role: str, student_name: str = "Candidate"):
         super().__init__()
         self.audit_id = audit_id
         self.target_role = target_role
         self.student_name = student_name
+        self.last_follow_up: Optional[str] = None
         self._processed_turns = 0
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
@@ -103,56 +214,70 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                 last_msg = messages[-1]
                 if isinstance(last_msg, dict) and last_msg.get("role") == "user":
                     content = str(last_msg.get("content", "")).strip()
-                    await self._evaluate_and_persist(content)
+                    await self._evaluate_turn(content, messages)
 
         await self.push_frame(frame, direction)
 
-    async def _evaluate_and_persist(self, answer_text: str):
+    async def _evaluate_turn(self, answer_text: str, conversation_history: List[Dict[str, str]]):
+        # Skip trivial single-word acknowledgments ("yes", "ok", "sure", "hello")
         words = answer_text.split()
-        if len(words) < 5:
-            # Skip trivial acknowledgments ("yes", "ok", "I see")
+        if len(words) < 2:
             return
 
         self._processed_turns += 1
 
-        tech_keywords = [
-            "react", "node", "python", "javascript", "typescript", "aws", "docker",
-            "kubernetes", "sql", "postgresql", "mongodb", "redis", "rest", "graphql",
-            "fastapi", "django", "flask", "c++", "java", "golang", "rust", "webrtc",
-            "ci/cd", "git", "microservices", "testing", "pytest", "jest", "redux", "next.js"
-        ]
-
-        detected_skills = [kw for kw in tech_keywords if kw in answer_text.lower()]
-        primary_skill = detected_skills[0].title() if detected_skills else f"{self.target_role} Core"
-
-        if len(words) >= 20 or len(detected_skills) >= 2:
-            strength = "strong"
-            score = 88
-            level = "Advanced"
-        elif len(words) >= 10 or len(detected_skills) == 1:
-            strength = "moderate"
-            score = 75
-            level = "Intermediate"
-        else:
-            strength = "basic"
-            score = 60
-            level = "Foundational"
-
-        asyncio.create_task(
-            notify_careervoice_signal(
-                audit_id=self.audit_id,
-                skill_name=primary_skill,
-                extracted_level=level,
-                confidence_score=score,
-                evidence_strength=strength,
-                raw_answer=answer_text,
+        try:
+            assessment = await evaluate_student_evidence_llm(
+                answer_text=answer_text,
+                target_role=self.target_role,
+                conversation_history=conversation_history,
             )
-        )
+
+            if not assessment:
+                return
+
+            if assessment.get("evidenceFound") is True:
+                skill_name = assessment.get("skillName")
+                extracted_level = assessment.get("extractedLevel")
+                confidence_score = assessment.get("confidenceScore")
+                evidence_strength = assessment.get("evidenceStrength") or "moderate"
+                evidence_snippet = assessment.get("evidenceSnippet") or answer_text
+
+                if skill_name and extracted_level and confidence_score is not None:
+                    asyncio.create_task(
+                        notify_careervoice_signal(
+                            audit_id=self.audit_id,
+                            skill_name=str(skill_name),
+                            extracted_level=str(extracted_level),
+                            confidence_score=int(confidence_score),
+                            evidence_strength=str(evidence_strength),
+                            raw_answer=str(evidence_snippet),
+                        )
+                    )
+            else:
+                # Weak evidence or claims without substance -> no score persisted
+                requires_follow_up = assessment.get("requiresFollowUp")
+                follow_up = assessment.get("followUpQuestion")
+                if requires_follow_up and follow_up:
+                    self.last_follow_up = follow_up
+                    logger.info(
+                        "evidence_insufficient_follow_up_required",
+                        audit_id=self.audit_id,
+                        skill=assessment.get("skillName"),
+                        follow_up=follow_up,
+                    )
+        except Exception as e:
+            # Evaluator errors must NEVER kill the live voice call
+            logger.warning(
+                "evidence_evaluator_frame_error",
+                audit_id=self.audit_id,
+                error=str(e),
+            )
 
 
 def create_llm_service(provider_preference: str = "gemini"):
     """
-    Instantiates the configured LLM provider service.
+    Instantiates the configured LLM provider service based on availability.
     Order of selection:
     1. Google Gemini (configured model via GEMINI_MODEL, defaults to gemini-3.6-flash)
     2. Anthropic Claude 3.5 Sonnet

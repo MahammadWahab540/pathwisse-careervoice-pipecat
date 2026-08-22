@@ -1,11 +1,11 @@
-name: Live WebRTC Provider Smoke Test
+name: Live WebRTC Provider Provisioning Smoke Test
 
 on:
   workflow_dispatch:
 
 jobs:
   smoke_test:
-    name: Execute Daily & LiveKit Live Smoke Tests
+    name: Execute Daily & LiveKit Provider Provisioning Smoke Tests
     runs-on: ubuntu-latest
 
     steps:
@@ -23,13 +23,13 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Run Daily.co Live Smoke Test
+      - name: Run Daily Provider Provisioning Smoke Test
         env:
           DAILY_API_KEY: ${{ secrets.DAILY_API_KEY }}
         run: |
           python scripts/smoke-daily.py
 
-      - name: Run LiveKit Live Smoke Test
+      - name: Run LiveKit Provider Provisioning Smoke Test
         env:
           LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
           LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}

@@ -422,24 +422,37 @@ async def test_career_voice_evidence_evaluator_triggers_signal_on_pipeline_frame
         student_name="Candidate",
     )
 
-    with patch("bot.notify_careervoice_signal", new_callable=AsyncMock) as mock_signal:
-        from pipecat.processors.frame_processor import FrameDirection
-        frame = LLMMessagesFrame(
-            messages=[
-                {"role": "assistant", "content": "What did you build recently?"},
-                {
-                    "role": "user",
-                    "content": "I built a real-time analytics dashboard with React, Node.js, and PostgreSQL using Docker microservices.",
-                },
-            ]
-        )
+    assessment = {
+        "skillName": "React",
+        "evidenceFound": True,
+        "extractedLevel": "Advanced",
+        "confidenceScore": 88,
+        "evidenceStrength": "strong",
+        "evidenceSnippet": "Built analytics dashboard with React and PostgreSQL.",
+        "requiresFollowUp": False,
+        "followUpQuestion": None,
+    }
 
-        await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
-        await asyncio.sleep(0.05)  # Allow async background task to schedule
+    with patch("bot.evaluate_student_evidence_llm", new_callable=AsyncMock, return_value=assessment):
+        with patch("bot.notify_careervoice_signal", new_callable=AsyncMock) as mock_signal:
+            from pipecat.processors.frame_processor import FrameDirection
+            frame = LLMMessagesFrame(
+                messages=[
+                    {"role": "assistant", "content": "What did you build recently?"},
+                    {
+                        "role": "user",
+                        "content": "I built a real-time analytics dashboard with React, Node.js, and PostgreSQL using Docker microservices.",
+                    },
+                ]
+            )
 
-        mock_signal.assert_called_once()
-        call_kwargs = mock_signal.call_args[1]
-        assert call_kwargs["audit_id"] == "audit-pipeline-test-01"
-        assert "React" in call_kwargs["skill_name"] or "Node" in call_kwargs["skill_name"]
-        assert call_kwargs["evidence_strength"] == "strong"
-        assert call_kwargs["extracted_level"] == "Advanced"
+            await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0.05)  # Allow async background task to schedule
+
+            mock_signal.assert_called_once()
+            call_kwargs = mock_signal.call_args[1]
+            assert call_kwargs["audit_id"] == "audit-pipeline-test-01"
+            assert call_kwargs["skill_name"] == "React"
+            assert call_kwargs["evidence_strength"] == "strong"
+            assert call_kwargs["extracted_level"] == "Advanced"
+            assert call_kwargs["confidence_score"] == 88

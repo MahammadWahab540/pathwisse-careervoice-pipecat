@@ -2,7 +2,7 @@
 
 Production-ready, real-time multimodal conversational AI agent for **Pathwisse CareerVoice** built on [Pipecat](https://github.com/pipecat-ai/pipecat).
 
-Supports **Daily.co** and **LiveKit** WebRTC transports behind a unified transport abstraction, with **automatic pre-session failover** and **multi-model LLM fallback** across Google Gemini, Anthropic Claude, and OpenAI GPT-4o.
+Supports **Daily.co** and **LiveKit** WebRTC transports behind a unified transport abstraction, with **automatic pre-session failover** and **LLM provider selection** across Google Gemini, Anthropic Claude, and OpenAI GPT-4o.
 
 ---
 
@@ -21,9 +21,11 @@ Transport Router (Daily ⇄ LiveKit pre-session failover)
    ↓          ↓
       Pipecat
          ↓
- Deepgram STT
+  Deepgram STT
          ↓
-      Gemini (or Claude / OpenAI fallback)
+CareerVoice Evidence Evaluator (LLM Structured Assessment)
+         ↓
+    Gemini 3.6 Flash (or Claude / OpenAI fallback)
          ↓
    Cartesia TTS
 ```
@@ -35,14 +37,19 @@ Transport Router (Daily ⇄ LiveKit pre-session failover)
 - **Dual Transport Abstraction**:
   - **Daily.co**: Default WebRTC transport (`VOICE_TRANSPORT_DEFAULT=daily`).
   - **LiveKit**: Fully selectable WebRTC transport (`VOICE_TRANSPORT_FALLBACK=livekit`).
-  - Safe pre-session failover if the primary transport fails during provisioning.
+  - Safe pre-session failover if the primary transport fails during room provisioning.
 - **Provider-Agnostic Voice Pipeline**:
   - **VAD**: Silero VAD (instant interruption & barge-in detection).
   - **STT**: Deepgram Nova-2 (real-time streaming transcription).
   - **TTS**: Cartesia Sonic (<100ms ultra-low latency synthesis).
-  - **LLM**: Google Gemini (`gemini-2.0-flash` / `gemini-1.5-flash`), with transparent fallback to Anthropic Claude 3.5 Sonnet and OpenAI GPT-4o-mini.
-- **Deterministic CareerVoice Integration**:
-  - Automatically posts candidate claims & extracted skills to CareerVoice's backend (`POST /api/audit/evidence/signal`).
+  - **LLM**: LLM provider selection based on configured provider availability.
+    - **Primary**: Google Gemini (`GEMINI_MODEL=gemini-3.6-flash`).
+    - **Alternate configured providers**: Anthropic Claude 3.5 Sonnet / OpenAI GPT-4o-mini.
+- **Evidence-Based Assessment & Persistence**:
+  - Asynchronously evaluates candidate conversational responses using structured LLM analysis.
+  - Verifies concrete engineering evidence (what they built, tools used, architecture decisions, trade-offs, bugs solved) before persisting signals.
+  - Vague statements and simple technology mentions ("I know React", "I studied Python") produce no scores and prompt follow-up probes instead.
+  - Posts verified signals to CareerVoice backend (`POST /api/audit/evidence/signal`).
 
 ---
 
@@ -122,10 +129,10 @@ source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 # Install dependencies
 pip install -r requirements.txt
 
-# Run Unit Tests
+# Run Unit & Integration Tests
 pytest tests/
 
-# Run Smoke Tests
+# Run Provider Provisioning Smoke Tests
 python scripts/smoke-daily.py
 python scripts/smoke-livekit.py
 

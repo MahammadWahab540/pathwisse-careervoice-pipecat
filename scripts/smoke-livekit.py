@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Smoke test script for LiveKit WebRTC Transport.
+Smoke test script for LiveKit Provider Provisioning.
 Validates room naming, scoped student & bot JWT generation, LiveKit API room verification, and cleanup.
+
+TODO: Production WebRTC E2E Test (planned for dedicated test harness):
+participant joins -> bot joins -> audio arrives -> Deepgram transcript -> Gemini response -> Cartesia audio -> disconnect
 """
 import os
 import sys
@@ -20,10 +23,10 @@ async def main():
     api_secret = os.getenv("LIVEKIT_API_SECRET", "").strip()
 
     if not (url and api_key and api_secret):
-        print("[SKIPPED] LIVEKIT_URL, LIVEKIT_API_KEY, or LIVEKIT_API_SECRET not set. Skipping live LiveKit smoke test.")
+        print("[SKIPPED] LIVEKIT_URL, LIVEKIT_API_KEY, or LIVEKIT_API_SECRET not set. Skipping LiveKit Provider Provisioning Smoke Test.")
         sys.exit(0)
 
-    print("[+] Starting LiveKit Transport Live Smoke Test...")
+    print("[+] Starting LiveKit Provider Provisioning Smoke Test...")
     provider = LiveKitVoiceTransportProvider(url=url, api_key=api_key, api_secret=api_secret)
 
     try:
@@ -55,9 +58,9 @@ async def main():
         except ImportError:
             print("[✓] livekit-api client verified token signature generation")
 
-        print("[✓] LiveKit WebRTC Transport Smoke Test: PASS")
+        print("[✓] LiveKit Provider Provisioning Smoke Test: PASS")
     except Exception as e:
-        print(f"[FAILED] LiveKit Smoke Test Failed: {e}")
+        print(f"[FAILED] LiveKit Provider Provisioning Smoke Test Failed: {e}")
         sys.exit(1)
 
 

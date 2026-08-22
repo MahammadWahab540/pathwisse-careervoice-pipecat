@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Smoke test script for Daily.co WebRTC Transport.
+Smoke test script for Daily.co Provider Provisioning.
 Validates room provisioning, scoped token isolation, room lifecycle validation, and cleanup.
+
+TODO: Production WebRTC E2E Test (planned for dedicated test harness):
+participant joins -> bot joins -> audio arrives -> Deepgram transcript -> Gemini response -> Cartesia audio -> disconnect
 """
 import os
 import sys
@@ -18,10 +21,10 @@ load_dotenv()
 async def main():
     api_key = os.getenv("DAILY_API_KEY", "").strip()
     if not api_key:
-        print("[SKIPPED] DAILY_API_KEY is not set. Skipping live Daily smoke test.")
+        print("[SKIPPED] DAILY_API_KEY is not set. Skipping Daily Provider Provisioning Smoke Test.")
         sys.exit(0)
 
-    print("[+] Starting Daily.co Transport Live Smoke Test...")
+    print("[+] Starting Daily Provider Provisioning Smoke Test...")
     provider = DailyVoiceTransportProvider(api_key=api_key)
 
     try:
@@ -60,9 +63,9 @@ async def main():
                 if del_resp.status in (200, 204):
                     print("[✓] Cleaned up Daily test room successfully")
 
-        print("[✓] Daily WebRTC Transport Smoke Test: PASS")
+        print("[✓] Daily Provider Provisioning Smoke Test: PASS")
     except Exception as e:
-        print(f"[FAILED] Daily Smoke Test Failed: {e}")
+        print(f"[FAILED] Daily Provider Provisioning Smoke Test Failed: {e}")
         sys.exit(1)
 
 
