@@ -10,6 +10,8 @@ from dotenv import load_dotenv
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+from pipecat.frames.frames import Frame, LLMMessagesFrame
 from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.google import GoogleLLMService
@@ -80,6 +82,74 @@ async def notify_careervoice_signal(
         )
 
 
+class CareerVoiceEvidenceEvaluator(FrameProcessor):
+    """
+    Evaluates candidate conversational responses in real-time within the Pipecat pipeline
+    and asynchronously persists structured skill signals to the CareerVoice backend.
+    """
+    def __init__(self, audit_id: str, target_role: str, student_name: str = "Candidate"):
+        super().__init__()
+        self.audit_id = audit_id
+        self.target_role = target_role
+        self.student_name = student_name
+        self._processed_turns = 0
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, LLMMessagesFrame):
+            messages = frame.messages
+            if messages and len(messages) > 0:
+                last_msg = messages[-1]
+                if isinstance(last_msg, dict) and last_msg.get("role") == "user":
+                    content = str(last_msg.get("content", "")).strip()
+                    await self._evaluate_and_persist(content)
+
+        await self.push_frame(frame, direction)
+
+    async def _evaluate_and_persist(self, answer_text: str):
+        words = answer_text.split()
+        if len(words) < 5:
+            # Skip trivial acknowledgments ("yes", "ok", "I see")
+            return
+
+        self._processed_turns += 1
+
+        tech_keywords = [
+            "react", "node", "python", "javascript", "typescript", "aws", "docker",
+            "kubernetes", "sql", "postgresql", "mongodb", "redis", "rest", "graphql",
+            "fastapi", "django", "flask", "c++", "java", "golang", "rust", "webrtc",
+            "ci/cd", "git", "microservices", "testing", "pytest", "jest", "redux", "next.js"
+        ]
+
+        detected_skills = [kw for kw in tech_keywords if kw in answer_text.lower()]
+        primary_skill = detected_skills[0].title() if detected_skills else f"{self.target_role} Core"
+
+        if len(words) >= 20 or len(detected_skills) >= 2:
+            strength = "strong"
+            score = 88
+            level = "Advanced"
+        elif len(words) >= 10 or len(detected_skills) == 1:
+            strength = "moderate"
+            score = 75
+            level = "Intermediate"
+        else:
+            strength = "basic"
+            score = 60
+            level = "Foundational"
+
+        asyncio.create_task(
+            notify_careervoice_signal(
+                audit_id=self.audit_id,
+                skill_name=primary_skill,
+                extracted_level=level,
+                confidence_score=score,
+                evidence_strength=strength,
+                raw_answer=answer_text,
+            )
+        )
+
+
 def create_llm_service(provider_preference: str = "gemini"):
     """
     Instantiates the configured LLM provider service.
@@ -126,7 +196,7 @@ def create_llm_service(provider_preference: str = "gemini"):
 async def run_careervoice_agent(session_config: VoiceSessionConfig):
     """
     Executes a real-time conversational CareerVoice audit session using the specified transport (Daily or LiveKit).
-    The pipeline logic (VAD -> STT -> LLM -> TTS -> evidence persistence) is provider-agnostic.
+    The pipeline logic (VAD -> STT -> Evidence Evaluator -> LLM -> TTS -> WebRTC) is provider-agnostic.
     """
     start_time = time.time()
     audit_id = session_config.audit_id
@@ -148,7 +218,7 @@ async def run_careervoice_agent(session_config: VoiceSessionConfig):
         transport = provider.create_pipecat_transport(session_config)
 
         logger.info(
-            "voice_bot_joined",
+            "voice_transport_initialized",
             audit_id=audit_id,
             provider=provider_name,
             room_name=session_config.room_name,
@@ -184,12 +254,19 @@ Rules:
         tma_in = LLMUserResponseAggregator(messages)
         tma_out = LLMAssistantResponseAggregator(messages)
 
-        # Provider-independent pipeline
+        evidence_evaluator = CareerVoiceEvidenceEvaluator(
+            audit_id=audit_id,
+            target_role=target_role,
+            student_name=student_name,
+        )
+
+        # Provider-independent pipeline with integrated real-time evidence evaluation
         pipeline = Pipeline(
             [
                 transport.input(),
                 stt,
                 tma_in,
+                evidence_evaluator,
                 llm,
                 tts,
                 transport.output(),

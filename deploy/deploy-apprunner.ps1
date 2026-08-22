@@ -105,9 +105,14 @@ if (-not $GeminiArn) { Write-Error "Missing required secret: careervoice/gemini-
 
 $HasDaily = [bool]$DailyArn
 $HasLiveKit = [bool]($LiveKitUrlArn -and $LiveKitKeyArn -and $LiveKitSecretArn)
+$HasPartialLiveKit = [bool]($LiveKitUrlArn -or $LiveKitKeyArn -or $LiveKitSecretArn) -and -not $HasLiveKit
+
+if ($HasPartialLiveKit) {
+  Write-Warning "WARNING: Partial LiveKit configuration detected. LiveKit transport disabled."
+}
 
 if (-not $HasDaily -and -not $HasLiveKit) {
-  Write-Error "At least one transport (Daily or LiveKit) must have all required secrets configured."
+  Write-Error "At least one transport (Daily or fully configured LiveKit) must have all required secrets configured."
   $MissingRequired = $true
 }
 
@@ -123,7 +128,7 @@ $SecretsList = @(
 )
 
 if ($DailyArn) { $SecretsList += "`"DAILY_API_KEY`": `"$DailyArn`"" }
-if ($LiveKitUrlArn) {
+if ($HasLiveKit) {
   $SecretsList += "`"LIVEKIT_URL`": `"$LiveKitUrlArn`""
   $SecretsList += "`"LIVEKIT_API_KEY`": `"$LiveKitKeyArn`""
   $SecretsList += "`"LIVEKIT_API_SECRET`": `"$LiveKitSecretArn`""

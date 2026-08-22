@@ -138,10 +138,14 @@ HAS_DAILY=0
 if [ -n "$DAILY_ARN" ]; then HAS_DAILY=1; fi
 
 HAS_LIVEKIT=0
-if [ -n "$LIVEKIT_URL_ARN" ] && [ -n "$LIVEKIT_KEY_ARN" ] && [ -n "$LIVEKIT_SECRET_ARN" ]; then HAS_LIVEKIT=1; fi
+if [ -n "$LIVEKIT_URL_ARN" ] && [ -n "$LIVEKIT_KEY_ARN" ] && [ -n "$LIVEKIT_SECRET_ARN" ]; then
+  HAS_LIVEKIT=1
+elif [ -n "$LIVEKIT_URL_ARN" ] || [ -n "$LIVEKIT_KEY_ARN" ] || [ -n "$LIVEKIT_SECRET_ARN" ]; then
+  echo "WARNING: Partial LiveKit configuration detected. LiveKit transport disabled."
+fi
 
 if [ $HAS_DAILY -eq 0 ] && [ $HAS_LIVEKIT -eq 0 ]; then
-  echo "ERROR: At least one transport (Daily or LiveKit) must have required secrets configured."
+  echo "ERROR: At least one transport (Daily or fully configured LiveKit) must have required secrets configured."
   MISSING_REQUIRED=1
 fi
 
@@ -156,7 +160,7 @@ SECRETS_JSON="\"CAREERVOICE_SERVICE_TOKEN\": \"${SERVICE_TOKEN_ARN}\", \"DEEPGRA
 if [ -n "$DAILY_ARN" ]; then
   SECRETS_JSON="${SECRETS_JSON}, \"DAILY_API_KEY\": \"${DAILY_ARN}\""
 fi
-if [ -n "$LIVEKIT_URL_ARN" ]; then
+if [ $HAS_LIVEKIT -eq 1 ]; then
   SECRETS_JSON="${SECRETS_JSON}, \"LIVEKIT_URL\": \"${LIVEKIT_URL_ARN}\", \"LIVEKIT_API_KEY\": \"${LIVEKIT_KEY_ARN}\", \"LIVEKIT_API_SECRET\": \"${LIVEKIT_SECRET_ARN}\""
 fi
 if [ -n "$ANTHROPIC_ARN" ]; then
