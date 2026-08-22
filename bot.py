@@ -1,7 +1,7 @@
 import os
 import sys
-import json
 import asyncio
+import time
 from typing import Optional, Dict, Any, List
 import aiohttp
 from loguru import logger
@@ -10,8 +10,6 @@ from dotenv import load_dotenv
 from pipecat.pipeline.pipeline import Pipeline
 from pipecat.pipeline.runner import PipelineRunner
 from pipecat.pipeline.task import PipelineParams, PipelineTask
-from pipecat.transports.services.daily import DailyParams, DailyTransport
-from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.services.deepgram import DeepgramSTTService
 from pipecat.services.cartesia import CartesiaTTSService
 from pipecat.services.google import GoogleLLMService
@@ -22,15 +20,17 @@ from pipecat.processors.aggregators.llm_response import (
     LLMUserResponseAggregator,
 )
 
+from transports import router, VoiceSessionConfig
+
 load_dotenv()
 
-CAREERVOICE_API_URL = os.getenv("CAREERVOICE_API_URL", "http://localhost:5000")
-DAILY_API_KEY = os.getenv("DAILY_API_KEY", "")
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "")
-CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
-ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+CAREERVOICE_API_URL = os.getenv("CAREERVOICE_API_URL", "http://localhost:5000").rstrip("/")
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
+CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "").strip()
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.0-flash").strip()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
 
 
 async def notify_careervoice_signal(
@@ -54,83 +54,94 @@ async def notify_careervoice_signal(
                 "source": "pipecat_voice_probe",
             }
             async with session.post(
-                f"{CAREERVOICE_API_URL}/api/audit/evidence/signal", json=payload
+                f"{CAREERVOICE_API_URL}/api/audit/evidence/signal", json=payload, timeout=aiohttp.ClientTimeout(total=5)
             ) as resp:
-                if resp.status != 201 and resp.status != 200:
-                    logger.warning(f"CareerVoice signal notification returned status {resp.status}")
+                if resp.status not in (200, 201):
+                    logger.warning(
+                        "careervoice_signal_failed",
+                        audit_id=audit_id,
+                        status=resp.status,
+                    )
     except Exception as e:
-        logger.error(f"Failed to post signal to CareerVoice backend: {e}")
+        logger.error(
+            "careervoice_signal_post_error",
+            audit_id=audit_id,
+            error=str(e),
+        )
 
 
 def create_llm_service(provider_preference: str = "gemini"):
     """
     Instantiates the appropriate LLM service with fallback capability.
     Order of preference:
-    1. Google Gemini 1.5 Flash
+    1. Google Gemini (configured model via GEMINI_MODEL)
     2. Anthropic Claude 3.5 Sonnet
     3. OpenAI GPT-4o-mini
     """
     if GEMINI_API_KEY and provider_preference == "gemini":
-        logger.info("Initializing Google Gemini 1.5 Flash as Primary LLM")
+        logger.info("Initializing Google Gemini as Primary LLM", model=GEMINI_MODEL)
         return GoogleLLMService(
             api_key=GEMINI_API_KEY,
-            model="models/gemini-1.5-flash-latest",
+            model=GEMINI_MODEL,
         )
     elif ANTHROPIC_API_KEY:
-        logger.info("Initializing Anthropic Claude 3.5 Sonnet as LLM")
+        logger.info("Initializing Anthropic Claude as LLM", model="claude-3-5-sonnet-20241022")
         return AnthropicLLMService(
             api_key=ANTHROPIC_API_KEY,
             model="claude-3-5-sonnet-20241022",
         )
     elif OPENAI_API_KEY:
-        logger.info("Initializing OpenAI GPT-4o-mini as LLM")
+        logger.info("Initializing OpenAI GPT-4o-mini as LLM", model="gpt-4o-mini")
         return OpenAILLMService(
             api_key=OPENAI_API_KEY,
             model="gpt-4o-mini",
         )
     elif GEMINI_API_KEY:
+        logger.info("Initializing Google Gemini fallback", model=GEMINI_MODEL)
         return GoogleLLMService(
             api_key=GEMINI_API_KEY,
-            model="models/gemini-1.5-flash-latest",
+            model=GEMINI_MODEL,
         )
     else:
-        raise ValueError("No LLM API keys configured (GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY required).")
+        raise RuntimeError(
+            "No usable LLM provider is configured. One of GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY must be set."
+        )
 
 
-async def run_careervoice_agent(
-    room_url: str,
-    token: str,
-    audit_id: str,
-    target_role: str,
-    student_name: str = "Candidate",
-):
-    """Executes a real-time conversational CareerVoice audit session using Pipecat."""
-    logger.info(f"Starting CareerVoice Pipecat Agent for audit: {audit_id} in room: {room_url}")
+async def run_careervoice_agent(session_config: VoiceSessionConfig):
+    """
+    Executes a real-time conversational CareerVoice audit session using the specified transport (Daily or LiveKit).
+    The pipeline logic (VAD -> STT -> LLM -> TTS -> evidence persistence) is provider-agnostic.
+    """
+    start_time = time.time()
+    audit_id = session_config.audit_id
+    provider_name = session_config.provider
+    target_role = session_config.target_role
+    student_name = session_config.student_name
 
-    transport = DailyTransport(
-        room_url,
-        token,
-        "Qalam - AI Career Auditor",
-        DailyParams(
-            audio_out_enabled=True,
-            audio_in_enabled=True,
-            camera_out_enabled=False,
-            camera_in_enabled=False,
-            vad_enabled=True,
-            vad_analyzer=SileroVADAnalyzer(),
-            transcription_enabled=False,
-        ),
+    logger.info(
+        "voice_bot_started",
+        audit_id=audit_id,
+        provider=provider_name,
+        target_role=target_role,
+        room_name=session_config.room_name,
     )
 
-    stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
-    tts = CartesiaTTSService(
-        api_key=CARTESIA_API_KEY,
-        voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",  # British / Natural conversational persona
-    )
+    try:
+        # Resolve transport provider from abstraction factory
+        provider = router.get_provider(provider_name)
+        transport = provider.create_pipecat_transport(session_config)
 
-    llm = create_llm_service()
+        # STT & TTS Providers
+        stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
+        tts = CartesiaTTSService(
+            api_key=CARTESIA_API_KEY,
+            voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",  # British / Natural conversational persona
+        )
 
-    system_instruction = f"""You are Qalam, Pathwisse CareerVoice's lead AI Career Auditor.
+        llm = create_llm_service()
+
+        system_instruction = f"""You are Qalam, Pathwisse CareerVoice's lead AI Career Auditor.
 You are conducting a strict, encouraging, and evidence-focused 1-on-1 career audit with {student_name} for the role: "{target_role}".
 
 Rules:
@@ -140,51 +151,83 @@ Rules:
 4. Keep tone warm, professional, and analytical.
 """
 
-    messages = [
-        {"role": "system", "content": system_instruction},
-        {
-            "role": "assistant",
-            "content": f"Hello {student_name}! I am Qalam, your AI Career Auditor for the {target_role} track. Let's begin by looking at your latest technical project. What did you build, and what core technologies did you use?",
-        },
-    ]
-
-    tma_in = LLMUserResponseAggregator(messages)
-    tma_out = LLMAssistantResponseAggregator(messages)
-
-    pipeline = Pipeline(
-        [
-            transport.input(),
-            stt,
-            tma_in,
-            llm,
-            tts,
-            transport.output(),
-            tma_out,
+        messages = [
+            {"role": "system", "content": system_instruction},
+            {
+                "role": "assistant",
+                "content": f"Hello {student_name}! I am Qalam, your AI Career Auditor for the {target_role} track. Let's begin by looking at your latest technical project. What did you build, and what core technologies did you use?",
+            },
         ]
-    )
 
-    task = PipelineTask(
-        pipeline,
-        PipelineParams(
-            allow_interruptions=True,
-            enable_metrics=True,
-            report_only_initial_ttfb=True,
-        ),
-    )
+        tma_in = LLMUserResponseAggregator(messages)
+        tma_out = LLMAssistantResponseAggregator(messages)
 
-    runner = PipelineRunner()
-    await runner.run(task)
+        # Provider-independent pipeline
+        pipeline = Pipeline(
+            [
+                transport.input(),
+                stt,
+                tma_in,
+                llm,
+                tts,
+                transport.output(),
+                tma_out,
+            ]
+        )
+
+        task = PipelineTask(
+            pipeline,
+            PipelineParams(
+                allow_interruptions=True,
+                enable_metrics=True,
+                report_only_initial_ttfb=True,
+            ),
+        )
+
+        runner = PipelineRunner()
+        await runner.run(task)
+
+        duration = round(time.time() - start_time, 2)
+        logger.info(
+            "voice_session_completed",
+            audit_id=audit_id,
+            provider=provider_name,
+            duration=duration,
+        )
+
+    except Exception as e:
+        duration = round(time.time() - start_time, 2)
+        logger.error(
+            "voice_session_failed",
+            audit_id=audit_id,
+            provider=provider_name,
+            duration=duration,
+            error=str(e),
+        )
+        raise
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 5:
-        print("Usage: python bot.py <room_url> <token> <audit_id> <target_role> [student_name]")
+        print("Usage: python bot.py <provider: daily|livekit> <room_url> <token> <audit_id> <target_role> [student_name] [room_name]")
         sys.exit(1)
 
-    r_url = sys.argv[1]
-    tkn = sys.argv[2]
-    aud_id = sys.argv[3]
-    role = sys.argv[4]
-    name = sys.argv[5] if len(sys.argv) > 5 else "Candidate"
+    prov = sys.argv[1]
+    r_url = sys.argv[2]
+    tkn = sys.argv[3]
+    aud_id = sys.argv[4]
+    role = sys.argv[5] if len(sys.argv) > 5 else "Software Engineer"
+    name = sys.argv[6] if len(sys.argv) > 6 else "Candidate"
+    r_name = sys.argv[7] if len(sys.argv) > 7 else f"careervoice-{aud_id}"
 
-    asyncio.run(run_careervoice_agent(r_url, tkn, aud_id, role, name))
+    cfg = VoiceSessionConfig(
+        audit_id=aud_id,
+        target_role=role,
+        student_name=name,
+        provider=prov,
+        room_url=r_url,
+        room_name=r_name,
+        token=tkn,
+    )
+
+    asyncio.run(run_careervoice_agent(cfg))

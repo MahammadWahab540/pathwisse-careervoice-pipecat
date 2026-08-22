@@ -1,97 +1,145 @@
-# Pathwisse CareerVoice - Pipecat Multi-Model Voice Agent
+# Pathwisse CareerVoice - Pipecat Dual Transport (Daily + LiveKit) Voice Agent
 
-Production-ready, real-time multimodal conversational AI agent for **Pathwisse CareerVoice** built on top of [Pipecat](https://github.com/pipecat-ai/pipecat).
+Production-ready, real-time multimodal conversational AI agent for **Pathwisse CareerVoice** built on [Pipecat](https://github.com/pipecat-ai/pipecat).
 
-Designed for ultra-low latency (<300ms) WebRTC voice audits with **multi-model fallback across Google Gemini, Anthropic Claude, and OpenAI GPT-4o**.
-
----
-
-## ⚡ Key Features
-
-- **Multi-Model LLM Resilience**:
-  - **Primary**: Google Gemini 1.5 Flash
-  - **Fallback 1**: Anthropic Claude 3.5 Sonnet
-  - **Fallback 2**: OpenAI GPT-4o-mini
-- **Ultra-Low Latency Audio Stack**:
-  - **STT**: Deepgram Nova-2 (real-time streaming transcription)
-  - **TTS**: Cartesia Sonic (<100ms ultra-low latency voice synthesis)
-  - **VAD & Interruption**: Silero VAD (instant barge-in detection)
-- **Deterministic CareerVoice Integration**:
-  - Automatically posts extracted candidate claims & skills asynchronously to CareerVoice's backend (`POST /api/audit/evidence/signal`).
-- **Turnkey AWS Deployment**:
-  - Ready for **AWS App Runner** or **AWS ECS Fargate** via automated CI/CD and 1-click deployment scripts.
+Supports **Daily.co** and **LiveKit** WebRTC transports behind a unified transport abstraction, with **automatic pre-session failover** and **multi-model LLM fallback** across Google Gemini, Anthropic Claude, and OpenAI GPT-4o.
 
 ---
 
-## 🚀 Architecture
+## ⚡ Architecture & Transport Router
 
-```mermaid
-flowchart LR
-    StudentBrowser["Student Browser (WebRTC / Daily.co)"] <-->|Low Latency Audio Stream| Pipecat["Pipecat Agent (FastAPI / WebRTC)"]
-    Pipecat <-->|STT / TTS / LLM| Models["AI Providers (Gemini / Claude / Cartesia / Deepgram)"]
-    Pipecat -->|POST /api/audit/evidence/signal| Backend["CareerVoice Node.js Backend"]
-    Backend <--> Supabase[("Supabase DB")]
+```text
+CareerVoice Frontend
+        ↓
+POST /api/voice/session
+        ↓
+CareerVoice Pipecat
+        ↓
+Transport Router (Daily ⇄ LiveKit pre-session failover)
+   ┌────┴────┐
+ Daily     LiveKit
+   ↓          ↓
+      Pipecat
+         ↓
+ Deepgram STT
+         ↓
+      Gemini (or Claude / OpenAI fallback)
+         ↓
+   Cartesia TTS
 ```
 
 ---
 
-## 🛠️ Local Development
+## 🚀 Key Capabilities
 
-### 1. Prerequisites
-- Python 3.11+
-- Daily.co, Deepgram, Cartesia, and Gemini API keys
+- **Dual Transport Abstraction**:
+  - **Daily.co**: Default WebRTC transport (`VOICE_TRANSPORT_DEFAULT=daily`).
+  - **LiveKit**: Fully selectable WebRTC transport (`VOICE_TRANSPORT_FALLBACK=livekit`).
+  - Safe pre-session failover if the primary transport fails during provisioning.
+- **Provider-Agnostic Voice Pipeline**:
+  - **VAD**: Silero VAD (instant interruption & barge-in detection).
+  - **STT**: Deepgram Nova-2 (real-time streaming transcription).
+  - **TTS**: Cartesia Sonic (<100ms ultra-low latency synthesis).
+  - **LLM**: Google Gemini (`gemini-2.0-flash` / `gemini-1.5-flash`), with transparent fallback to Anthropic Claude 3.5 Sonnet and OpenAI GPT-4o-mini.
+- **Deterministic CareerVoice Integration**:
+  - Automatically posts candidate claims & extracted skills to CareerVoice's backend (`POST /api/audit/evidence/signal`).
 
-### 2. Setup
+---
+
+## 📡 API Contract (`POST /api/voice/session`)
+
+### Request
+```json
+{
+  "auditId": "8f3b6c21-1234-4567-89ab-cdef01234567",
+  "targetRole": "Full Stack Developer",
+  "studentName": "Alex",
+  "transport": "daily"
+}
+```
+*(Note: `transport` is optional. If omitted, `VOICE_TRANSPORT_DEFAULT` is used).*
+
+---
+
+### Response: Daily Provider
+```json
+{
+  "success": true,
+  "auditId": "8f3b6c21-1234-4567-89ab-cdef01234567",
+  "provider": "daily",
+  "roomUrl": "https://careervoice.daily.co/careervoice-8f3b6c21-1724310000",
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "connection": {
+    "url": "https://careervoice.daily.co/careervoice-8f3b6c21-1724310000",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "roomName": "careervoice-8f3b6c21-1724310000"
+  }
+}
+```
+
+---
+
+### Response: LiveKit Provider
+```json
+{
+  "success": true,
+  "auditId": "8f3b6c21-1234-4567-89ab-cdef01234567",
+  "provider": "livekit",
+  "roomUrl": "wss://careervoice.livekit.cloud",
+  "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+  "connection": {
+    "url": "wss://careervoice.livekit.cloud",
+    "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+    "roomName": "careervoice-8f3b6c21-1234-4567-89ab-cdef01234567",
+    "extra": {
+      "studentIdentity": "student-8f3b6c21-1234-4567-89ab-cdef01234567",
+      "botIdentity": "qalam-8f3b6c21-1234-4567-89ab-cdef01234567"
+    }
+  }
+}
+```
+
+---
+
+## 🖥️ Frontend Client Connection Guide
+
+The CareerVoice frontend routes connection logic based on `response.provider`:
+
+* **`provider === "daily"`**: Connect using `@daily-co/daily-js` with `connection.url` and `connection.token`.
+* **`provider === "livekit"`**: Connect using `livekit-client` (`Room.connect(connection.url, connection.token)`).
+
+---
+
+## 🛠️ Local Development & Testing
+
 ```bash
-# Clone the repository
+# Clone & create venv
 git clone https://github.com/MahammadWahab540/pathwisse-careervoice-pipecat.git
 cd pathwisse-careervoice-pipecat
-
-# Create virtual environment
 python -m venv .venv
 source .venv/bin/activate  # On Windows: .venv\Scripts\activate
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Copy environment variables
-cp .env.example .env
-```
+# Run Unit Tests
+pytest tests/
 
-### 3. Run the Voice Server
-```bash
+# Run Smoke Tests
+python scripts/smoke-daily.py
+python scripts/smoke-livekit.py
+
+# Start Server
 python server.py
 ```
-The server will start on `http://localhost:8000`.
-
-Check health:
-```bash
-curl http://localhost:8000/health
-```
 
 ---
 
-## ☁️ Deploying to AWS (AWS App Runner)
+## ☁️ AWS Deployment (App Runner + Secrets Manager + OIDC)
 
-### Automated 1-Click Deployment
+Deploy using the automated 1-click script:
 ```bash
-# Using PowerShell (Windows)
 cd deploy
-.\deploy-apprunner.ps1 -Region ap-south-1
-
-# Using Bash (Linux / macOS / AWS CloudShell)
-cd deploy
-chmod +x deploy-apprunner.sh
 ./deploy-apprunner.sh
 ```
-
----
-
-## 🔄 GitHub Actions CI/CD
-
-Add the following GitHub Secrets to your repository (`Settings -> Secrets and variables -> Actions`):
-* `AWS_ACCESS_KEY_ID`
-* `AWS_SECRET_ACCESS_KEY`
-* `AWS_REGION` (`ap-south-1`)
-
-Pushing to `main` automatically builds the Docker container, pushes to Amazon ECR, and deploys to AWS App Runner.
+Or via GitHub Actions with OpenID Connect (OIDC) authentication on push to `main`.

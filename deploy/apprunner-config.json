@@ -8,7 +8,21 @@
         "Port": "8000",
         "RuntimeEnvironmentVariables": {
           "PORT": "8000",
-          "CAREERVOICE_API_URL": "https://careervoice.pathwisse.com"
+          "CAREERVOICE_API_URL": "https://careervoice.pathwisse.com",
+          "VOICE_TRANSPORT_DEFAULT": "daily",
+          "VOICE_TRANSPORT_FALLBACK": "livekit",
+          "GEMINI_MODEL": "gemini-2.0-flash"
+        },
+        "RuntimeEnvironmentSecrets": {
+          "DAILY_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/daily-api-key",
+          "LIVEKIT_URL": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/livekit-url",
+          "LIVEKIT_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/livekit-api-key",
+          "LIVEKIT_API_SECRET": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/livekit-api-secret",
+          "DEEPGRAM_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/deepgram-api-key",
+          "CARTESIA_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/cartesia-api-key",
+          "GEMINI_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/gemini-api-key",
+          "ANTHROPIC_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/anthropic-api-key",
+          "OPENAI_API_KEY": "arn:aws:secretsmanager:<REGION>:<ACCOUNT_ID>:secret:careervoice/openai-api-key"
         }
       }
     },
@@ -19,7 +33,8 @@
   },
   "InstanceConfiguration": {
     "Cpu": "1024",
-    "Memory": "2048"
+    "Memory": "2048",
+    "InstanceRoleArn": "<APPRUNNER_RUNTIME_ROLE_ARN>"
   },
   "HealthCheckConfiguration": {
     "Protocol": "HTTP",

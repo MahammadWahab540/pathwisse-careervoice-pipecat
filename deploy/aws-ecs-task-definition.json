@@ -4,6 +4,8 @@
   "requiresCompatibilities": ["FARGATE"],
   "cpu": "1024",
   "memory": "2048",
+  "executionRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/CareerVoiceEcsTaskExecutionRole",
+  "taskRoleArn": "arn:aws:iam::<AWS_ACCOUNT_ID>:role/CareerVoiceAppRunnerRuntimeRole",
   "containerDefinitions": [
     {
       "name": "pipecat-voice-agent",
@@ -18,15 +20,21 @@
       ],
       "environment": [
         { "name": "PORT", "value": "8000" },
-        { "name": "CAREERVOICE_API_URL", "value": "https://careervoice.pathwisse.com" }
+        { "name": "CAREERVOICE_API_URL", "value": "https://careervoice.pathwisse.com" },
+        { "name": "VOICE_TRANSPORT_DEFAULT", "value": "daily" },
+        { "name": "VOICE_TRANSPORT_FALLBACK", "value": "livekit" },
+        { "name": "GEMINI_MODEL", "value": "gemini-2.0-flash" }
       ],
       "secrets": [
-        { "name": "DAILY_API_KEY", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT>:secret:DAILY_API_KEY" },
-        { "name": "DEEPGRAM_API_KEY", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT>:secret:DEEPGRAM_API_KEY" },
-        { "name": "CARTESIA_API_KEY", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT>:secret:CARTESIA_API_KEY" },
-        { "name": "GEMINI_API_KEY", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT>:secret:GEMINI_API_KEY" },
-        { "name": "ANTHROPIC_API_KEY", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT>:secret:ANTHROPIC_API_KEY" },
-        { "name": "OPENAI_API_KEY", "valueFrom": "arn:aws:secretsmanager:<REGION>:<ACCOUNT>:secret:OPENAI_API_KEY" }
+        { "name": "DAILY_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/daily-api-key" },
+        { "name": "LIVEKIT_URL", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/livekit-url" },
+        { "name": "LIVEKIT_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/livekit-api-key" },
+        { "name": "LIVEKIT_API_SECRET", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/livekit-api-secret" },
+        { "name": "DEEPGRAM_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/deepgram-api-key" },
+        { "name": "CARTESIA_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/cartesia-api-key" },
+        { "name": "GEMINI_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/gemini-api-key" },
+        { "name": "ANTHROPIC_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/anthropic-api-key" },
+        { "name": "OPENAI_API_KEY", "valueFrom": "arn:aws:secretsmanager:<AWS_REGION>:<AWS_ACCOUNT_ID>:secret:careervoice/openai-api-key" }
       ],
       "logConfiguration": {
         "logDriver": "awslogs",
