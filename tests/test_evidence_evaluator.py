@@ -28,7 +28,7 @@ async def test_weak_evidence_i_know_react_produces_no_signal():
         "confidenceScore": None,
         "evidenceStrength": "insufficient",
         "evidenceSnippet": None,
-        "requiresFollowUp": true,
+        "requiresFollowUp": True,
         "followUpQuestion": "Tell me about a React project where you handled state or debugging.",
     }
 
@@ -63,7 +63,7 @@ async def test_weak_evidence_i_studied_python_produces_no_signal():
         "confidenceScore": None,
         "evidenceStrength": "insufficient",
         "evidenceSnippet": None,
-        "requiresFollowUp": true,
+        "requiresFollowUp": True,
         "followUpQuestion": "What backend services or algorithms did you write in Python?",
     }
 
@@ -102,7 +102,7 @@ async def test_long_generic_answer_no_automatic_advanced_score():
         "confidenceScore": None,
         "evidenceStrength": "insufficient",
         "evidenceSnippet": None,
-        "requiresFollowUp": true,
+        "requiresFollowUp": True,
         "followUpQuestion": "Can you describe a specific software application you personally implemented?",
     }
 
@@ -138,7 +138,7 @@ async def test_multiple_technology_keywords_no_automatic_strong_evidence():
         "confidenceScore": None,
         "evidenceStrength": "insufficient",
         "evidenceSnippet": None,
-        "requiresFollowUp": true,
+        "requiresFollowUp": True,
         "followUpQuestion": "Pick one of those tools like Docker or PostgreSQL and describe how you integrated it into a project.",
     }
 
