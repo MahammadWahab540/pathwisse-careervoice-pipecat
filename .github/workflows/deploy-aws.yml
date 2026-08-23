@@ -14,6 +14,9 @@ jobs:
   test-and-deploy:
     name: Build, Test & Deploy to AWS App Runner
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout repository
