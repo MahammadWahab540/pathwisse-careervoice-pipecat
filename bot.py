@@ -7,6 +7,7 @@ load_dotenv()
 import re
 import sys
 import json
+import uuid
 import asyncio
 import time
 from typing import Optional, Dict, Any, List, Set, Literal
@@ -32,6 +33,7 @@ from pipecat.processors.aggregators.llm_response import (
 from transports import router, VoiceSessionConfig
 
 CAREERVOICE_API_URL = os.getenv("CAREERVOICE_API_URL", "http://localhost:5000").rstrip("/")
+CAREERVOICE_SERVICE_TOKEN = os.getenv("CAREERVOICE_SERVICE_TOKEN", "").strip()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -103,56 +105,117 @@ async def notify_careervoice_signal(
     evidence_strength: str,
     raw_answer: str,
     source_turns: Optional[List[Dict[str, Any]]] = None,
-):
-    """Post verified skill evidence signal asynchronously back to CareerVoice backend."""
+    user_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    max_retries: int = 3,
+    initial_backoff: float = 0.5,
+) -> bool:
+    """Post verified skill evidence signal asynchronously back to CareerVoice backend with retry and backoff."""
+    if not idempotency_key:
+        idempotency_key = uuid.uuid4().hex
+
+    service_token = CAREERVOICE_SERVICE_TOKEN or os.getenv("CAREERVOICE_SERVICE_TOKEN", "").strip()
+    api_url = CAREERVOICE_API_URL or os.getenv("CAREERVOICE_API_URL", "http://localhost:5000").rstrip("/")
+
+    strength_map = {
+        "strong": "Strong",
+        "moderate": "Moderate",
+        "insufficient": "None",
+        "weak": "Weak",
+    }
+    canonical_strength = strength_map.get(evidence_strength.lower(), "Moderate")
+
+    # Canonical payload compliant with CareerVoice API contract
+    student_id = user_id or os.getenv("CAREERVOICE_USER_ID", "").strip() or None
+    payload: Dict[str, Any] = {
+        "auditId": audit_id,
+        "studentId": student_id,
+        "userId": student_id,
+        "skillName": skill_name,
+        "skillId": skill_name,
+        "extractedLevel": extracted_level,
+        "confidenceScore": confidence_score,
+        "score": confidence_score,
+        "evidenceStrength": canonical_strength,
+        "rawAnswerSnippet": raw_answer[:300],
+        "evidence": raw_answer[:300],
+        "source": "voice_probe",
+        "idempotencyKey": idempotency_key,
+    }
+    if source_turns:
+        payload["evidenceSourceTurns"] = source_turns
+
+    headers = {"Content-Type": "application/json"}
+    if service_token:
+        headers["Authorization"] = f"Bearer {service_token}"
+
     logger.info(
         "evidence_persistence_started",
         audit_id=audit_id,
         skill_name=skill_name,
         extracted_level=extracted_level,
         confidence_score=confidence_score,
+        evidence_strength=canonical_strength,
     )
-    try:
-        payload: Dict[str, Any] = {
-            "auditId": audit_id,
-            "skillName": skill_name,
-            "extractedLevel": extracted_level,
-            "confidenceScore": confidence_score,
-            "evidenceStrength": evidence_strength,
-            "rawAnswerSnippet": raw_answer[:300],
-            "source": "pipecat_voice_probe",
-        }
-        if source_turns:
-            payload["evidenceSourceTurns"] = source_turns
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{CAREERVOICE_API_URL}/api/audit/evidence/signal",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                if resp.status in (200, 201):
-                    logger.info(
-                        "evidence_persistence_completed",
-                        audit_id=audit_id,
-                        skill_name=skill_name,
-                        status_code=resp.status,
-                    )
-                else:
-                    logger.warning(
-                        "evidence_persistence_failed",
-                        audit_id=audit_id,
-                        status=resp.status,
-                    )
-    except asyncio.CancelledError:
-        logger.warning("evidence_persistence_cancelled", audit_id=audit_id)
-        raise
-    except Exception as e:
-        logger.error(
-            "evidence_persistence_failed",
-            audit_id=audit_id,
-            error=str(e),
-        )
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{api_url}/api/audit/evidence/signal",
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status in (200, 201):
+                        logger.info(
+                            "evidence_persistence_completed",
+                            audit_id=audit_id,
+                            skill_name=skill_name,
+                            status_code=resp.status,
+                            attempt=attempt,
+                        )
+                        return True
+                    elif 400 <= resp.status < 500:
+                        # Client / contract errors should not be blindly retried
+                        logger.warning(
+                            "evidence_persistence_client_error",
+                            audit_id=audit_id,
+                            skill_name=skill_name,
+                            status_code=resp.status,
+                        )
+                        return False
+                    else:
+                        logger.warning(
+                            "evidence_persistence_server_error",
+                            audit_id=audit_id,
+                            skill_name=skill_name,
+                            status_code=resp.status,
+                            attempt=attempt,
+                        )
+        except asyncio.CancelledError:
+            logger.warning("evidence_persistence_cancelled", audit_id=audit_id)
+            raise
+        except Exception as e:
+            logger.warning(
+                "evidence_persistence_network_error",
+                audit_id=audit_id,
+                skill_name=skill_name,
+                attempt=attempt,
+                error=str(e),
+            )
+
+        if attempt < max_retries:
+            backoff = initial_backoff * (2 ** (attempt - 1))
+            await asyncio.sleep(backoff)
+
+    logger.error(
+        "evidence_persistence_exhausted_retries",
+        audit_id=audit_id,
+        skill_name=skill_name,
+        attempts=max_retries,
+    )
+    return False
 
 
 # ==============================================================================
@@ -405,11 +468,19 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
     Immediately forwards frames downstream so realtime voice synthesis is never delayed.
     Enforces bounded concurrency, turn deduplication, task tracking, and graceful persistence shutdown.
     """
-    def __init__(self, audit_id: str, target_role: str, student_name: str = "Candidate", max_concurrent: int = 2):
+    def __init__(
+        self,
+        audit_id: str,
+        target_role: str,
+        student_name: str = "Candidate",
+        student_id: Optional[str] = None,
+        max_concurrent: int = 2,
+    ):
         super().__init__()
         self.audit_id = audit_id
         self.target_role = target_role
         self.student_name = student_name
+        self.student_id = student_id
         self.last_follow_up: Optional[str] = None
         self._max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
@@ -528,6 +599,7 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                             evidence_strength=str(assessment.evidenceStrength),
                             raw_answer=raw_provenance_snippet,
                             source_turns=source_turns,
+                            user_id=self.student_id,
                         )
                     )
                     self._track_task(persist_task, self._persistence_tasks)
@@ -743,6 +815,7 @@ Rules:
             audit_id=audit_id,
             target_role=target_role,
             student_name=student_name,
+            student_id=session_config.student_id or session_config.user_id,
         )
 
         # Provider-independent pipeline with non-blocking evidence evaluator

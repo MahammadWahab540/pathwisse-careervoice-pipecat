@@ -30,6 +30,8 @@ class VoiceSessionConfig(BaseModel):
     audit_id: str
     target_role: str
     student_name: str = "Candidate"
+    student_id: Optional[str] = None
+    user_id: Optional[str] = None
     provider: str
     room_url: str
     room_name: str

@@ -681,3 +681,152 @@ async def test_hanging_persistence_tasks_cancelled_and_awaited_on_shutdown():
             assert len(evaluator._evaluation_tasks) == 0
             assert len(evaluator._persistence_tasks) == 0
 
+
+# ==============================================================================
+# 5. notify_careervoice_signal Contract & Retry Tests
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_notify_careervoice_signal_payload_and_auth():
+    """Validates that notify_careervoice_signal sends canonical payload and Bearer auth."""
+    sent_requests = []
+
+    class MockResponse:
+        def __init__(self, status):
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    class MockSession:
+        def post(self, url, json=None, headers=None, timeout=None):
+            sent_requests.append({"url": url, "json": json, "headers": headers})
+            return MockResponse(201)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    with patch.dict(os.environ, {"CAREERVOICE_SERVICE_TOKEN": "test-secret-token", "CAREERVOICE_API_URL": "http://localhost:5000"}):
+        with patch("aiohttp.ClientSession", return_value=MockSession()):
+            success = await notify_careervoice_signal(
+                audit_id="audit-uuid-123",
+                skill_name="React",
+                extracted_level="Advanced",
+                confidence_score=90,
+                evidence_strength="strong",
+                raw_answer="Built custom state management hooks in React",
+                user_id="user-uuid-456",
+                idempotency_key="idempotency-key-789",
+            )
+
+            assert success is True
+            assert len(sent_requests) == 1
+            req = sent_requests[0]
+            assert req["url"] == "http://localhost:5000/api/audit/evidence/signal"
+            assert req["headers"]["Authorization"] == "Bearer test-secret-token"
+            assert req["json"]["source"] == "voice_probe"
+            assert req["json"]["auditId"] == "audit-uuid-123"
+            assert req["json"]["studentId"] == "user-uuid-456"
+            assert req["json"]["skillName"] == "React"
+            assert req["json"]["evidenceStrength"] == "Strong"
+            assert req["json"]["confidenceScore"] == 90
+            assert req["json"]["idempotencyKey"] == "idempotency-key-789"
+
+
+@pytest.mark.asyncio
+async def test_notify_careervoice_signal_retries_transient_failures():
+    """Transient 500 server errors are retried up to max_retries before returning False."""
+    attempts = 0
+
+    class MockResponse:
+        def __init__(self, status):
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    class MockSession:
+        def post(self, url, json=None, headers=None, timeout=None):
+            nonlocal attempts
+            attempts += 1
+            if attempts < 3:
+                return MockResponse(503)
+            return MockResponse(200)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    with patch("aiohttp.ClientSession", return_value=MockSession()):
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            success = await notify_careervoice_signal(
+                audit_id="audit-retry-123",
+                skill_name="Python",
+                extracted_level="Intermediate",
+                confidence_score=75,
+                evidence_strength="moderate",
+                raw_answer="Wrote async services with asyncio",
+                max_retries=3,
+                initial_backoff=0.01,
+            )
+
+            assert success is True
+            assert attempts == 3
+            assert mock_sleep.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_notify_careervoice_signal_does_not_retry_client_error():
+    """Client errors (400 Bad Request) are not blindly retried."""
+    attempts = 0
+
+    class MockResponse:
+        def __init__(self, status):
+            self.status = status
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    class MockSession:
+        def post(self, url, json=None, headers=None, timeout=None):
+            nonlocal attempts
+            attempts += 1
+            return MockResponse(400)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    with patch("aiohttp.ClientSession", return_value=MockSession()):
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            success = await notify_careervoice_signal(
+                audit_id="audit-400-123",
+                skill_name="Docker",
+                extracted_level="Intermediate",
+                confidence_score=70,
+                evidence_strength="moderate",
+                raw_answer="Created multi-stage Dockerfiles",
+                max_retries=3,
+                initial_backoff=0.01,
+            )
+
+            assert success is False
+            assert attempts == 1
+            assert mock_sleep.call_count == 0
+
+
