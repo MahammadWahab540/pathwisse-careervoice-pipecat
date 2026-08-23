@@ -761,7 +761,7 @@ Rules:
 
         task = PipelineTask(
             pipeline,
-            PipelineParams(
+            params=PipelineParams(
                 allow_interruptions=True,
                 enable_metrics=True,
                 report_only_initial_ttfb=True,
