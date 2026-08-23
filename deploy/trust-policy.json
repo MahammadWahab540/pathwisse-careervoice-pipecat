@@ -14,7 +14,7 @@
         "StringLike": {
           "token.actions.githubusercontent.com:sub": [
             "repo:MahammadWahab540/pathwisse-careervoice-pipecat:ref:refs/heads/main",
-            "repo:mahammadwahab540/pathwisse-careervoice-pipecat:ref:refs/heads/main"
+            "repo:MahammadWahab540/pathwisse-careervoice-pipecat:*"
           ]
         }
       }
