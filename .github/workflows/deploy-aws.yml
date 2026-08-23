@@ -37,6 +37,13 @@ jobs:
         run: |
           pytest -v
 
+      - name: Inspect OIDC Token Claims
+        run: |
+          TOKEN=$(curl -sLS "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" -H "User-Agent: actions/runner" -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r '.value')
+          echo "=== OIDC JWT CLAIMS ==="
+          echo "$TOKEN" | cut -d. -f2 | base64 -d | jq '{iss, sub, aud, repository, repository_owner, ref, event_name}'
+          echo "=== END CLAIMS ==="
+
       - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
