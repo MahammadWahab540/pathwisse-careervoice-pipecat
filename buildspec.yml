@@ -1,0 +1,18 @@
+version: 0.2
+
+phases:
+  pre_build:
+    commands:
+      - echo Logging in to Amazon ECR...
+      - aws ecr get-login-password --region ap-south-1 | docker login --username AWS --password-stdin 439093223097.dkr.ecr.ap-south-1.amazonaws.com
+  build:
+    commands:
+      - echo Build started on `date`
+      - echo Building the Docker image...
+      - docker build -t 439093223097.dkr.ecr.ap-south-1.amazonaws.com/careervoice-pipecat:latest -t 439093223097.dkr.ecr.ap-south-1.amazonaws.com/careervoice-pipecat:release .
+  post_build:
+    commands:
+      - echo Build completed on `date`
+      - echo Pushing the Docker images...
+      - docker push 439093223097.dkr.ecr.ap-south-1.amazonaws.com/careervoice-pipecat:latest
+      - docker push 439093223097.dkr.ecr.ap-south-1.amazonaws.com/careervoice-pipecat:release
