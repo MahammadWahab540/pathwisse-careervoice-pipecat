@@ -117,6 +117,11 @@ resolve_secret_arn() {
 SERVICE_TOKEN_ARN=$(resolve_secret_arn "careervoice/service-token")
 DEEPGRAM_ARN=$(resolve_secret_arn "careervoice/deepgram-api-key")
 CARTESIA_ARN=$(resolve_secret_arn "careervoice/cartesia-api-key")
+NOVITA_ARN=$(resolve_secret_arn "careervoice/novita-api-key")
+if [ -z "$NOVITA_ARN" ]; then
+  NOVITA_ARN=$(resolve_secret_arn "careervoice/fish-audio-api-key")
+fi
+FISH_REF_ID_ARN=$(resolve_secret_arn "careervoice/fish-audio-reference-id")
 GEMINI_ARN=$(resolve_secret_arn "careervoice/gemini-api-key")
 
 DAILY_ARN=$(resolve_secret_arn "careervoice/daily-api-key")
@@ -131,8 +136,14 @@ OPENAI_ARN=$(resolve_secret_arn "careervoice/openai-api-key")
 MISSING_REQUIRED=0
 if [ -z "$SERVICE_TOKEN_ARN" ]; then echo "ERROR: Missing required secret: careervoice/service-token"; MISSING_REQUIRED=1; fi
 if [ -z "$DEEPGRAM_ARN" ]; then echo "ERROR: Missing required secret: careervoice/deepgram-api-key"; MISSING_REQUIRED=1; fi
-if [ -z "$CARTESIA_ARN" ]; then echo "ERROR: Missing required secret: careervoice/cartesia-api-key"; MISSING_REQUIRED=1; fi
-if [ -z "$GEMINI_ARN" ]; then echo "ERROR: Missing required secret: careervoice/gemini-api-key"; MISSING_REQUIRED=1; fi
+if [ -z "$CARTESIA_ARN" ] && [ -z "$NOVITA_ARN" ]; then
+  echo "ERROR: At least one TTS provider secret must exist (careervoice/cartesia-api-key or careervoice/novita-api-key)."
+  MISSING_REQUIRED=1
+fi
+if [ -z "$GEMINI_ARN" ] && [ -z "$ANTHROPIC_ARN" ] && [ -z "$OPENAI_ARN" ]; then
+  echo "ERROR: At least one LLM provider secret must exist (careervoice/gemini-api-key, careervoice/anthropic-api-key, or careervoice/openai-api-key)."
+  MISSING_REQUIRED=1
+fi
 
 HAS_DAILY=0
 if [ -n "$DAILY_ARN" ]; then HAS_DAILY=1; fi
@@ -155,7 +166,20 @@ if [ $MISSING_REQUIRED -ne 0 ]; then
 fi
 
 # Build RuntimeEnvironmentSecrets JSON with resolved real ARNs
-SECRETS_JSON="\"CAREERVOICE_SERVICE_TOKEN\": \"${SERVICE_TOKEN_ARN}\", \"DEEPGRAM_API_KEY\": \"${DEEPGRAM_ARN}\", \"CARTESIA_API_KEY\": \"${CARTESIA_ARN}\", \"GEMINI_API_KEY\": \"${GEMINI_ARN}\""
+SECRETS_JSON="\"CAREERVOICE_SERVICE_TOKEN\": \"${SERVICE_TOKEN_ARN}\", \"DEEPGRAM_API_KEY\": \"${DEEPGRAM_ARN}\""
+
+if [ -n "$CARTESIA_ARN" ]; then
+  SECRETS_JSON="${SECRETS_JSON}, \"CARTESIA_API_KEY\": \"${CARTESIA_ARN}\""
+fi
+if [ -n "$NOVITA_ARN" ]; then
+  SECRETS_JSON="${SECRETS_JSON}, \"NOVITA_API_KEY\": \"${NOVITA_ARN}\""
+fi
+if [ -n "$FISH_REF_ID_ARN" ]; then
+  SECRETS_JSON="${SECRETS_JSON}, \"FISH_AUDIO_REFERENCE_ID\": \"${FISH_REF_ID_ARN}\""
+fi
+if [ -n "$GEMINI_ARN" ]; then
+  SECRETS_JSON="${SECRETS_JSON}, \"GEMINI_API_KEY\": \"${GEMINI_ARN}\""
+fi
 
 if [ -n "$DAILY_ARN" ]; then
   SECRETS_JSON="${SECRETS_JSON}, \"DAILY_API_KEY\": \"${DAILY_ARN}\""

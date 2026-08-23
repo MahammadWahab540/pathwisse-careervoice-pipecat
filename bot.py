@@ -632,6 +632,50 @@ def create_llm_service(provider_preference: str = "gemini"):
         )
 
 
+from services import FishAudioTTSService
+
+
+# ==============================================================================
+# TTS Service Factory
+# ==============================================================================
+def create_tts_service(provider_preference: Optional[str] = None):
+    """
+    Instantiates the configured TTS provider based on availability and preference.
+    Supported:
+    1. Cartesia Sonic (CARTESIA_API_KEY)
+    2. Novita AI / Fish Audio S1 (NOVITA_API_KEY or FISH_AUDIO_API_KEY)
+    """
+    cartesia_key = os.getenv("CARTESIA_API_KEY", "").strip()
+    novita_key = os.getenv("NOVITA_API_KEY", "").strip() or os.getenv("FISH_AUDIO_API_KEY", "").strip()
+    novita_ref_id = os.getenv("FISH_AUDIO_REFERENCE_ID", "").strip() or None
+    tts_pref = (provider_preference or os.getenv("TTS_PROVIDER", "cartesia")).strip().lower()
+
+    if (tts_pref in ("novita", "fish", "fish_audio") or not cartesia_key) and novita_key:
+        logger.info("Initializing Novita Fish Audio TTS as TTS Provider", model="s1")
+        return FishAudioTTSService(
+            api_key=novita_key,
+            reference_id=novita_ref_id,
+            sample_rate=16000,
+        )
+    elif cartesia_key:
+        logger.info("Initializing Cartesia Sonic TTS as TTS Provider")
+        return CartesiaTTSService(
+            api_key=cartesia_key,
+            voice_id=os.getenv("CARTESIA_VOICE_ID", "79a125e8-cd45-4c13-8a67-188112f4dd22"),
+        )
+    elif novita_key:
+        logger.info("Initializing Novita Fish Audio TTS fallback", model="s1")
+        return FishAudioTTSService(
+            api_key=novita_key,
+            reference_id=novita_ref_id,
+            sample_rate=16000,
+        )
+    else:
+        raise RuntimeError(
+            "No usable TTS provider is configured. One of CARTESIA_API_KEY or NOVITA_API_KEY must be set."
+        )
+
+
 # ==============================================================================
 # Voice Agent Pipeline Runner
 # ==============================================================================
@@ -670,10 +714,7 @@ async def run_careervoice_agent(session_config: VoiceSessionConfig):
 
         # STT & TTS Providers
         stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
-        tts = CartesiaTTSService(
-            api_key=CARTESIA_API_KEY,
-            voice_id="79a125e8-cd45-4c13-8a67-188112f4dd22",  # British / Natural conversational persona
-        )
+        tts = create_tts_service()
 
         llm = create_llm_service()
 

@@ -118,6 +118,9 @@ def readiness_check(response: Response):
 
     deepgram_ok = bool(os.getenv("DEEPGRAM_API_KEY", "").strip())
     cartesia_ok = bool(os.getenv("CARTESIA_API_KEY", "").strip())
+    novita_ok = bool(os.getenv("NOVITA_API_KEY", "").strip() or os.getenv("FISH_AUDIO_API_KEY", "").strip())
+    tts_ok = cartesia_ok or novita_ok
+
     gemini_ok = bool(os.getenv("GEMINI_API_KEY", "").strip())
     anthropic_ok = bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
     openai_ok = bool(os.getenv("OPENAI_API_KEY", "").strip())
@@ -126,7 +129,7 @@ def readiness_check(response: Response):
     transport_status = router.get_readiness_status()
     has_any_transport = any(t["configured"] for t in transport_status.values())
 
-    is_ready = has_any_transport and llm_ok and deepgram_ok and cartesia_ok and auth_ok
+    is_ready = has_any_transport and llm_ok and deepgram_ok and tts_ok and auth_ok
 
     if not is_ready:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -140,6 +143,8 @@ def readiness_check(response: Response):
         "providers": {
             "deepgram": deepgram_ok,
             "cartesia": cartesia_ok,
+            "novitaFish": novita_ok,
+            "tts": tts_ok,
             "llm": llm_ok,
             "gemini": gemini_ok,
             "anthropic": anthropic_ok,

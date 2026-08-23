@@ -86,6 +86,9 @@ function Resolve-SecretArn([string]$SecretId) {
 $ServiceTokenArn = Resolve-SecretArn "careervoice/service-token"
 $DeepgramArn = Resolve-SecretArn "careervoice/deepgram-api-key"
 $CartesiaArn = Resolve-SecretArn "careervoice/cartesia-api-key"
+$NovitaArn = Resolve-SecretArn "careervoice/novita-api-key"
+if (-not $NovitaArn) { $NovitaArn = Resolve-SecretArn "careervoice/fish-audio-api-key" }
+$FishRefIdArn = Resolve-SecretArn "careervoice/fish-audio-reference-id"
 $GeminiArn = Resolve-SecretArn "careervoice/gemini-api-key"
 
 $DailyArn = Resolve-SecretArn "careervoice/daily-api-key"
@@ -100,8 +103,14 @@ $OpenAiArn = Resolve-SecretArn "careervoice/openai-api-key"
 $MissingRequired = $false
 if (-not $ServiceTokenArn) { Write-Error "Missing required secret: careervoice/service-token"; $MissingRequired = $true }
 if (-not $DeepgramArn) { Write-Error "Missing required secret: careervoice/deepgram-api-key"; $MissingRequired = $true }
-if (-not $CartesiaArn) { Write-Error "Missing required secret: careervoice/cartesia-api-key"; $MissingRequired = $true }
-if (-not $GeminiArn) { Write-Error "Missing required secret: careervoice/gemini-api-key"; $MissingRequired = $true }
+if (-not $CartesiaArn -and -not $NovitaArn) {
+  Write-Error "At least one TTS provider secret must exist (careervoice/cartesia-api-key or careervoice/novita-api-key)."
+  $MissingRequired = $true
+}
+if (-not $GeminiArn -and -not $AnthropicArn -and -not $OpenAiArn) {
+  Write-Error "At least one LLM provider secret must exist (careervoice/gemini-api-key, careervoice/anthropic-api-key, or careervoice/openai-api-key)."
+  $MissingRequired = $true
+}
 
 $HasDaily = [bool]$DailyArn
 $HasLiveKit = [bool]($LiveKitUrlArn -and $LiveKitKeyArn -and $LiveKitSecretArn)
@@ -122,10 +131,13 @@ if ($MissingRequired) {
 
 $SecretsList = @(
   "`"CAREERVOICE_SERVICE_TOKEN`": `"$ServiceTokenArn`"",
-  "`"DEEPGRAM_API_KEY`": `"$DeepgramArn`"",
-  "`"CARTESIA_API_KEY`": `"$CartesiaArn`"",
-  "`"GEMINI_API_KEY`": `"$GeminiArn`""
+  "`"DEEPGRAM_API_KEY`": `"$DeepgramArn`""
 )
+
+if ($CartesiaArn) { $SecretsList += "`"CARTESIA_API_KEY`": `"$CartesiaArn`"" }
+if ($NovitaArn) { $SecretsList += "`"NOVITA_API_KEY`": `"$NovitaArn`"" }
+if ($FishRefIdArn) { $SecretsList += "`"FISH_AUDIO_REFERENCE_ID`": `"$FishRefIdArn`"" }
+if ($GeminiArn) { $SecretsList += "`"GEMINI_API_KEY`": `"$GeminiArn`"" }
 
 if ($DailyArn) { $SecretsList += "`"DAILY_API_KEY`": `"$DailyArn`"" }
 if ($HasLiveKit) {
