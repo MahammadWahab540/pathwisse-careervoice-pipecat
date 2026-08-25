@@ -6,7 +6,6 @@ from loguru import logger
 from .base import VoiceTransportProvider, SessionProvisionResult, VoiceSessionConfig, sanitize_identifier
 
 
-
 def get_websocket_transport_classes():
     """Dynamically resolves FastAPIWebsocketTransport classes across Pipecat versions."""
     try:
@@ -27,31 +26,9 @@ def get_websocket_transport_classes():
             return None, None
 
 
-
-def get_websocket_transport_classes():
-    """Dynamically resolves FastAPIWebsocketTransport classes across Pipecat versions."""
-    try:
-        from pipecat.transports.network.fastapi_websocket import (
-            FastAPIWebsocketTransport,
-            FastAPIWebsocketParams,
-        )
-        return FastAPIWebsocketTransport, FastAPIWebsocketParams
-    except ImportError:
-        try:
-            from pipecat.transports.services.websocket import (
-                FastAPIWebsocketTransport,
-                FastAPIWebsocketParams,
-            )
-            return FastAPIWebsocketTransport, FastAPIWebsocketParams
-        except ImportError as e:
-            logger.warning(f"FastAPIWebsocketTransport not directly importable: {e}")
-            return None, None
-
-
-
-class DirectWebsocketVoiceTransportProvider(VoiceTransportProvider):
+class DirectWebSocketVoiceTransportProvider(VoiceTransportProvider):
     """
-    Direct Websocket Voice Transport Provider.
+    Direct WebSocket Voice Transport Provider.
     Enables candidates and clients to connect directly to the Pipecat agent over standard
     WebSocket (ws:// or wss://) without requiring Daily.co, LiveKit, or any third-party WebRTC accounts.
     """
@@ -75,11 +52,11 @@ class DirectWebsocketVoiceTransportProvider(VoiceTransportProvider):
     ) -> SessionProvisionResult:
         sanitized_id = sanitize_identifier(audit_id)
         session_token = secrets.token_urlsafe(32)
-        room_name = fbws-{sanitized_id}"
+        room_name = f"ws-{sanitized_id}"
 
         base = self._ws_base_url
         if base:
-            ws_url = fb{base}/ws/voice/{sanitized_id}?token={session_token}"
+            ws_url = f"{base}/ws/voice/{sanitized_id}?token={session_token}"
         else:
             ws_url = f"/ws/voice/{sanitized_id}?token={session_token}"
 
