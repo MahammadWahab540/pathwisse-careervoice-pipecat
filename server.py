@@ -13,10 +13,20 @@ load_dotenv()
 from bot import run_careervoice_agent
 from transports import router, SessionProvisionResult, VoiceSessionConfig, sanitize_identifier
 
+from fastapi.middleware.cors import CORSMiddleware
+
 app = FastAPI(
     title="Pathwisse CareerVoice Pipecat Voice Server",
     description="Multi-Transport (Direct WebSocket + Daily + LiveKit) Real-time Voice Agent for Career Audits",
     version="2.3.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
