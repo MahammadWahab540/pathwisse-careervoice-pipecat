@@ -5,15 +5,19 @@ from loguru import logger
 from .base import VoiceTransportProvider, SessionProvisionResult, VoiceSessionConfig
 from .daily_transport import DailyVoiceTransportProvider
 from .livekit_transport import LiveKitVoiceTransportProvider
+from .websocket_transport import DirectWebSocketVoiceTransportProvider
 
 
 class TransportRouter:
-    """Manages WebRTC transport provider selection, provisioning, and pre-session failover."""
+    """Manages WebRTC & WebSocket transport provider selection, provisioning, and pre-session failover."""
 
     def __init__(self):
+        ws_provider = DirectWebSocketVoiceTransportProvider()
         self._providers: Dict[str, VoiceTransportProvider] = {
             "daily": DailyVoiceTransportProvider(),
             "livekit": LiveKitVoiceTransportProvider(),
+            "websocket": ws_provider,
+            "direct": ws_provider,
         }
 
     @property

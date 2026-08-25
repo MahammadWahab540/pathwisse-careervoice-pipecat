@@ -491,3 +491,50 @@ async def test_career_voice_evidence_evaluator_triggers_signal_on_pipeline_frame
             assert call_kwargs["extracted_level"] == "Advanced"
             assert call_kwargs["confidence_score"] == 88
             await evaluator.shutdown()
+
+
+# ==============================================================================
+# 9. Direct WebSocket Transport Tests (Zero Daily / Zero LiveKit Required)
+# ==============================================================================
+@pytest.mark.asyncio
+async def test_websocket_transport_always_configured():
+    from transports.websocket_transport import DirectWebSocketVoiceTransportProvider
+    provider = DirectWebSocketVoiceTransportProvider()
+    assert provider.is_configured() is True
+    assert provider.name == "websocket"
+
+
+@pytest.mark.asyncio
+async def test_websocket_provision_session_success():
+    from transports.websocket_transport import DirectWebSocketVoiceTransportProvider
+    provider = DirectWebSocketVoiceTransportProvider(ws_base_url="wss://voice.careervoice.io")
+    result = await provider.provision_session(
+        audit_id="audit_ws_test_01",
+        target_role="Full Stack Developer",
+        student_name="Candidate",
+    )
+    assert result.provider == "websocket"
+    assert result.audit_id == "audit_ws_test_01"
+    assert "wss://voice.careervoice.io/ws/voice/audit_ws_test_01?token=" in result.connection_url
+    assert result.extra["requires_third_party_account"] is False
+
+
+def test_start_session_endpoint_with_websocket_transport():
+    with patch.dict(os.environ, {"CAREERVOICE_SERVICE_TOKEN": "test-service-token"}):
+        with patch("server.run_careervoice_agent", new_callable=AsyncMock):
+            response = client.post(
+                "/api/voice/session",
+                json={
+                    "auditId": "audit_direct_ws_01",
+                    "targetRole": "Backend Developer",
+                    "studentName": "Alex",
+                    "transport": "websocket",
+                },
+                headers={"Authorization": "Bearer test-service-token"},
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is True
+            assert data["provider"] == "websocket"
+            assert "/ws/voice/audit_direct_ws_01" in data["connection"]["url"]
+
