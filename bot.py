@@ -111,9 +111,49 @@ async def notify_careervoice_signal(
     confidence_score: int,
     evidence_strength: str,
     raw_answer: str,
+    user_id: Optional[str] = None,
+    idempotency_key: Optional[str] = None,
+    max_retries: int = 3,
+    initial_backoff: float = 1.0,
     source_turns: Optional[List[Dict[str, Any]]] = None,
-):
-    """Post verified skill evidence signal asynchronously back to CareerVoice backend."""
+) -> bool:
+    """Post verified skill evidence signal asynchronously back to CareerVoice backend with retry logic."""
+    api_url = os.getenv("CAREERVOICE_API_URL", "http://localhost:5000").rstrip("/")
+    service_token = os.getenv("CAREERVOICE_SERVICE_TOKEN", "").strip()
+
+    strength_map = {
+        "strong": "Strong",
+        "moderate": "Moderate",
+        "insufficient": "Insufficient",
+        "Strong": "Strong",
+        "Moderate": "Moderate",
+        "Insufficient": "Insufficient",
+    }
+    normalized_strength = strength_map.get(
+        evidence_strength, evidence_strength.capitalize() if evidence_strength else "Moderate"
+    )
+
+    payload: Dict[str, Any] = {
+        "auditId": audit_id,
+        "skillName": skill_name,
+        "extractedLevel": extracted_level,
+        "confidenceScore": confidence_score,
+        "evidenceStrength": normalized_strength,
+        "rawAnswerSnippet": raw_answer[:300] if raw_answer else "",
+        "source": "voice_probe",
+    }
+
+    if user_id:
+        payload["studentId"] = user_id
+    if idempotency_key:
+        payload["idempotencyKey"] = idempotency_key
+    if source_turns:
+        payload["evidenceSourceTurns"] = source_turns
+
+    headers = {"Content-Type": "application/json"}
+    if service_token:
+        headers["Authorization"] = f"Bearer {service_token}"
+
     logger.info(
         "evidence_persistence_started",
         audit_id=audit_id,
@@ -121,47 +161,63 @@ async def notify_careervoice_signal(
         extracted_level=extracted_level,
         confidence_score=confidence_score,
     )
-    try:
-        payload: Dict[str, Any] = {
-            "auditId": audit_id,
-            "skillName": skill_name,
-            "extractedLevel": extracted_level,
-            "confidenceScore": confidence_score,
-            "evidenceStrength": evidence_strength,
-            "rawAnswerSnippet": raw_answer[:300],
-            "source": "pipecat_voice_probe",
-        }
-        if source_turns:
-            payload["evidenceSourceTurns"] = source_turns
 
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                f"{CAREERVOICE_API_URL}/api/audit/evidence/signal",
-                json=payload,
-                timeout=aiohttp.ClientTimeout(total=5),
-            ) as resp:
-                if resp.status in (200, 201):
-                    logger.info(
-                        "evidence_persistence_completed",
-                        audit_id=audit_id,
-                        skill_name=skill_name,
-                        status_code=resp.status,
-                    )
-                else:
-                    logger.warning(
-                        "evidence_persistence_failed",
-                        audit_id=audit_id,
-                        status=resp.status,
-                    )
-    except asyncio.CancelledError:
-        logger.warning("evidence_persistence_cancelled", audit_id=audit_id)
-        raise
-    except Exception as e:
-        logger.error(
-            "evidence_persistence_failed",
-            audit_id=audit_id,
-            error=str(e),
-        )
+    backoff = initial_backoff
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{api_url}/api/audit/evidence/signal",
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=5),
+                ) as resp:
+                    if resp.status in (200, 201):
+                        logger.info(
+                            "evidence_persistence_completed",
+                            audit_id=audit_id,
+                            skill_name=skill_name,
+                            status_code=resp.status,
+                        )
+                        return True
+                    elif 400 <= resp.status < 500:
+                        # Client errors (e.g. 400, 401, 403, 404, 422) should not be retried
+                        logger.warning(
+                            "evidence_persistence_client_error",
+                            audit_id=audit_id,
+                            status=resp.status,
+                        )
+                        return False
+                    else:
+                        # Server errors (5xx) or transient statuses
+                        logger.warning(
+                            "evidence_persistence_server_error",
+                            audit_id=audit_id,
+                            status=resp.status,
+                            attempt=attempt,
+                        )
+        except asyncio.CancelledError:
+            logger.warning("evidence_persistence_cancelled", audit_id=audit_id)
+            raise
+        except Exception as e:
+            logger.warning(
+                "evidence_persistence_attempt_failed",
+                audit_id=audit_id,
+                attempt=attempt,
+                error=str(e),
+            )
+
+        if attempt < max_retries:
+            await asyncio.sleep(backoff)
+            backoff *= 2
+
+    logger.error(
+        "evidence_persistence_exhausted_retries",
+        audit_id=audit_id,
+        skill_name=skill_name,
+        max_retries=max_retries,
+    )
+    return False
 
 
 # ==============================================================================
