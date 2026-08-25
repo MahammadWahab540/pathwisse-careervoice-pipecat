@@ -2,7 +2,7 @@ import os
 import secrets
 import asyncio
 from typing import Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Response, status
+from fastapi import FastAPI, HTTPException, BackgroundTasks, Header, Response, status, WebSocket, WebSocketDisconnect
 from pydantic import BaseModel, Field
 from loguru import logger
 from dotenv import load_dotenv
@@ -15,8 +15,8 @@ from transports import router, SessionProvisionResult, VoiceSessionConfig, sanit
 
 app = FastAPI(
     title="Pathwisse CareerVoice Pipecat Voice Server",
-    description="Dual Transport (Daily + LiveKit) Real-time Voice Agent for Career Audits",
-    version="2.2.0",
+    description="Multi-Transport (Direct WebSocket + Daily + LiveKit) Real-time Voice Agent for Career Audits",
+    version="2.3.0",
 )
 
 
@@ -33,7 +33,7 @@ class StartSessionRequest(BaseModel):
     studentName: Optional[str] = Field(default="Candidate", max_length=100, description="Candidate first name")
     studentId: Optional[str] = Field(default=None, max_length=64, description="Candidate UUID")
     userId: Optional[str] = Field(default=None, max_length=64, description="Candidate UUID (alias)")
-    transport: Optional[str] = Field(default=None, max_length=20, description="Optional transport: 'daily' | 'livekit'")
+    transport: Optional[str] = Field(default=None, max_length=20, description="Optional transport: 'websocket' | 'daily' | 'livekit'")
     # Backwards compatibility fields: existing callers that pre-provisioned Daily rooms
     roomUrl: Optional[str] = Field(default=None, max_length=256, description="Pre-provisioned Daily room URL (deprecated)")
     token: Optional[str] = Field(default=None, max_length=1024, description="Pre-provisioned Daily meeting token (deprecated)")
@@ -104,7 +104,7 @@ def health_check():
     return {
         "status": "healthy",
         "service": "careervoice-pipecat-voice-agent",
-        "transports": ["daily", "livekit"],
+        "transports": ["websocket", "daily", "livekit"],
     }
 
 
@@ -278,6 +278,38 @@ async def start_voice_session(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail="Voice session provisioning failed. Please retry.",
         )
+
+
+@app.websocket("/ws/voice/{audit_id}")
+async def websocket_voice_endpoint(websocket: WebSocket, audit_id: str, token: Optional[str] = None):
+    """
+    Direct WebSocket connection endpoint for real-time voice streaming.
+    Allows candidate audio frames to stream directly into the Pipecat pipeline
+    without requiring Daily.co, LiveKit, or any third-party WebRTC accounts.
+    """
+    await websocket.accept()
+    sanitized_id = sanitize_identifier(audit_id)
+    logger.info("websocket_voice_client_connected", audit_id=sanitized_id)
+    try:
+        session_config = VoiceSessionConfig(
+            audit_id=sanitized_id,
+            target_role="Full Stack Developer",
+            provider="websocket",
+            room_url=f"/ws/voice/{sanitized_id}",
+            room_name=f"ws-{sanitized_id}",
+            token=token or "anonymous",
+            connection_url=f"/ws/voice/{sanitized_id}",
+        )
+        setattr(session_config, "websocket", websocket)
+        await run_careervoice_agent(session_config)
+    except WebSocketDisconnect:
+        logger.info("websocket_voice_client_disconnected", audit_id=sanitized_id)
+    except Exception as err:
+        logger.error("websocket_voice_session_error", audit_id=sanitized_id, error=str(err))
+        try:
+            await websocket.close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
