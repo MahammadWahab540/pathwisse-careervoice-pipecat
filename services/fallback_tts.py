@@ -17,7 +17,8 @@ class FallbackTTSService(TTSService):
     Resilient Multi-Provider Fallback TTS Service for Pipecat.
     Sequentially attempts a prioritized list of TTS services (e.g. OpenRouter -> Cartesia -> Novita).
     If a provider fails or yields an ErrorFrame before emitting audio, it automatically fails over
-    to the next available configured provider without crashing the voice pipeline.
+    to the next available configured provider without crashing the voice pipeline or emitting
+    unbalanced lifecycle frames.
     """
 
     def __init__(
@@ -47,7 +48,7 @@ class FallbackTTSService(TTSService):
 
             emitted_audio = False
             provider_failed = False
-            buffered_frames: List[Frame] = []
+            pre_audio_buffer: List[Frame] = []
 
             try:
                 async for frame in provider.run_tts(text):
@@ -60,16 +61,25 @@ class FallbackTTSService(TTSService):
                         provider_failed = True
                         break
                     elif isinstance(frame, TTSAudioRawFrame):
-                        emitted_audio = True
+                        if not emitted_audio:
+                            # Flush buffered pre-audio lifecycle frames (e.g. TTSStartedFrame)
+                            for buf_frame in pre_audio_buffer:
+                                yield buf_frame
+                            pre_audio_buffer.clear()
+                            emitted_audio = True
                         yield frame
                     elif isinstance(frame, (TTSStartedFrame, TTSStoppedFrame)):
-                        # Pass lifecycle frames downstream
-                        yield frame
+                        if not emitted_audio:
+                            pre_audio_buffer.append(frame)
+                        else:
+                            yield frame
                     else:
-                        yield frame
+                        if not emitted_audio:
+                            pre_audio_buffer.append(frame)
+                        else:
+                            yield frame
 
                 if emitted_audio and not provider_failed:
-                    # Successfully synthesized and streamed audio
                     logger.debug(f"Provider {provider_name} successfully delivered speech output.")
                     return
 
@@ -79,7 +89,8 @@ class FallbackTTSService(TTSService):
                 provider_failed = True
 
             if emitted_audio:
-                # If audio was already partially sent, don't restart from beginning with next provider
+                # If audio was already partially sent and failed midway, ensure downstream lifecycle is closed
+                yield TTSStoppedFrame()
                 return
 
         # If all providers exhausted without success

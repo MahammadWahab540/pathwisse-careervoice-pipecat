@@ -555,15 +555,23 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                 latency_ms = round((time.time() - start_eval) * 1000, 2)
                 logger.warning("evidence_evaluation_error", audit_id=self.audit_id, error=str(e), eval_latency_ms=latency_ms)
 
-    async def shutdown(self, persistence_grace_seconds: float = 2.5):
-        eval_tasks = list(self._evaluation_tasks)
-        for task in eval_tasks:
-            if not task.done():
-                task.cancel()
-        if eval_tasks:
-            await asyncio.gather(*eval_tasks, return_exceptions=True)
+    async def shutdown(self, evaluation_grace_seconds: float = 3.0, persistence_grace_seconds: float = 2.5):
+        # 1. Allow in-flight evaluations to complete within bounded grace period
+        if self._evaluation_tasks:
+            pending_eval = list(self._evaluation_tasks)
+            try:
+                done_eval, unfinished_eval = await asyncio.wait(pending_eval, timeout=evaluation_grace_seconds)
+                if unfinished_eval:
+                    logger.warning("evidence_evaluation_shutdown_timeout", count=len(unfinished_eval), audit_id=self.audit_id)
+                    for t in unfinished_eval:
+                        if not t.done():
+                            t.cancel()
+                    await asyncio.gather(*unfinished_eval, return_exceptions=True)
+            except Exception as e:
+                logger.warning("evidence_evaluation_shutdown_error", error=str(e))
         self._evaluation_tasks.clear()
 
+        # 2. Allow persistence tasks to complete within bounded grace period
         if self._persistence_tasks:
             pending = list(self._persistence_tasks)
             try:
@@ -577,6 +585,26 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
             except Exception as e:
                 logger.warning("evidence_persistence_shutdown_error", error=str(e))
         self._persistence_tasks.clear()
+
+
+# ==============================================================================
+# STT Service Factory with Fallback
+# ==============================================================================
+def create_stt_service():
+    deepgram_key = os.getenv("DEEPGRAM_API_KEY", "").strip()
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    openrouter_model = os.getenv("OPENROUTER_STT_MODEL", "openai/whisper-large-v3").strip()
+
+    if deepgram_key:
+        logger.info("Initializing Deepgram as Primary STT")
+        return DeepgramSTTService(api_key=deepgram_key)
+    elif openrouter_key:
+        logger.info(f"Initializing OpenRouter STT Service (model={openrouter_model})")
+        return OpenRouterSTTService(api_key=openrouter_key, model=openrouter_model)
+    else:
+        raise RuntimeError(
+            "No usable STT provider is configured. One of DEEPGRAM_API_KEY or OPENROUTER_API_KEY must be set."
+        )
 
 
 # ==============================================================================
@@ -723,7 +751,7 @@ async def run_careervoice_agent(session_config: VoiceSessionConfig):
             room_name=session_config.room_name,
         )
 
-        stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
+        stt = create_stt_service()
         tts = create_tts_service()
         llm = create_llm_service()
 
