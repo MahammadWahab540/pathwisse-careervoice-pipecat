@@ -7,7 +7,6 @@ load_dotenv()
 import re
 import sys
 import json
-import uuid
 import asyncio
 import time
 from typing import Optional, Dict, Any, List, Set, Literal
@@ -33,13 +32,24 @@ from pipecat.processors.aggregators.llm_response import (
 from transports import router, VoiceSessionConfig
 
 CAREERVOICE_API_URL = os.getenv("CAREERVOICE_API_URL", "http://localhost:5000").rstrip("/")
-CAREERVOICE_SERVICE_TOKEN = os.getenv("CAREERVOICE_SERVICE_TOKEN", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+OPENROUTER_LLM_MODEL = os.getenv("OPENROUTER_LLM_MODEL", "openai/gpt-4o-mini").strip()
+OPENROUTER_TTS_MODEL = os.getenv("OPENROUTER_TTS_MODEL", "fish-audio/s2.1-pro").strip()
+OPENROUTER_TTS_VOICE = os.getenv("OPENROUTER_TTS_VOICE", "").strip()
+OPENROUTER_STT_MODEL = os.getenv("OPENROUTER_STT_MODEL", "openai/whisper-large-v3").strip()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "").strip()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+
+from services import (
+    FishAudioTTSService,
+    OpenRouterTTSService,
+    OpenRouterSTTService,
+    FallbackTTSService,
+)
 
 
 # ==============================================================================
@@ -62,11 +72,9 @@ class EvidenceAssessment(BaseModel):
 
     @model_validator(mode="after")
     def validate_assessment(self) -> "EvidenceAssessment":
-        # Rule 1: confidenceScore must be 0..100 if present
         if self.confidenceScore is not None and not (0 <= self.confidenceScore <= 100):
             raise ValueError(f"confidenceScore must be between 0 and 100, got {self.confidenceScore}")
 
-        # Rule 2: When evidenceFound == False -> no score, no level, strength must be insufficient, requiresFollowUp=True
         if not self.evidenceFound:
             if self.extractedLevel is not None:
                 raise ValueError("extractedLevel must be null when evidenceFound=false")
@@ -77,7 +85,6 @@ class EvidenceAssessment(BaseModel):
             if not self.requiresFollowUp:
                 raise ValueError("requiresFollowUp must be true when evidenceFound=false")
         else:
-            # Rule 3: When evidenceFound == True -> skillName, extractedLevel, confidenceScore, snippet required, requiresFollowUp=False
             if not self.skillName or not self.skillName.strip():
                 raise ValueError("skillName is required when evidenceFound=true")
             if not self.extractedLevel:
@@ -104,44 +111,42 @@ async def notify_careervoice_signal(
     confidence_score: int,
     evidence_strength: str,
     raw_answer: str,
-    source_turns: Optional[List[Dict[str, Any]]] = None,
     user_id: Optional[str] = None,
     idempotency_key: Optional[str] = None,
     max_retries: int = 3,
-    initial_backoff: float = 0.5,
+    initial_backoff: float = 1.0,
+    source_turns: Optional[List[Dict[str, Any]]] = None,
 ) -> bool:
-    """Post verified skill evidence signal asynchronously back to CareerVoice backend with retry and backoff."""
-    if not idempotency_key:
-        idempotency_key = uuid.uuid4().hex
-
-    service_token = CAREERVOICE_SERVICE_TOKEN or os.getenv("CAREERVOICE_SERVICE_TOKEN", "").strip()
-    api_url = CAREERVOICE_API_URL or os.getenv("CAREERVOICE_API_URL", "http://localhost:5000").rstrip("/")
+    """Post verified skill evidence signal asynchronously back to CareerVoice backend with retry logic."""
+    api_url = os.getenv("CAREERVOICE_API_URL", "http://localhost:5000").rstrip("/")
+    service_token = os.getenv("CAREERVOICE_SERVICE_TOKEN", "").strip()
 
     strength_map = {
         "strong": "Strong",
         "moderate": "Moderate",
-        "insufficient": "None",
-        "weak": "Weak",
+        "insufficient": "Insufficient",
+        "Strong": "Strong",
+        "Moderate": "Moderate",
+        "Insufficient": "Insufficient",
     }
-    canonical_strength = strength_map.get(evidence_strength.lower(), "Moderate")
+    normalized_strength = strength_map.get(
+        evidence_strength, evidence_strength.capitalize() if evidence_strength else "Moderate"
+    )
 
-    # Canonical payload compliant with CareerVoice API contract
-    student_id = user_id or os.getenv("CAREERVOICE_USER_ID", "").strip() or None
     payload: Dict[str, Any] = {
         "auditId": audit_id,
-        "studentId": student_id,
-        "userId": student_id,
         "skillName": skill_name,
-        "skillId": skill_name,
         "extractedLevel": extracted_level,
         "confidenceScore": confidence_score,
-        "score": confidence_score,
-        "evidenceStrength": canonical_strength,
-        "rawAnswerSnippet": raw_answer[:300],
-        "evidence": raw_answer[:300],
+        "evidenceStrength": normalized_strength,
+        "rawAnswerSnippet": raw_answer[:300] if raw_answer else "",
         "source": "voice_probe",
-        "idempotencyKey": idempotency_key,
     }
+
+    if user_id:
+        payload["studentId"] = user_id
+    if idempotency_key:
+        payload["idempotencyKey"] = idempotency_key
     if source_turns:
         payload["evidenceSourceTurns"] = source_turns
 
@@ -155,9 +160,9 @@ async def notify_careervoice_signal(
         skill_name=skill_name,
         extracted_level=extracted_level,
         confidence_score=confidence_score,
-        evidence_strength=canonical_strength,
     )
 
+    backoff = initial_backoff
     for attempt in range(1, max_retries + 1):
         try:
             async with aiohttp.ClientSession() as session:
@@ -173,24 +178,22 @@ async def notify_careervoice_signal(
                             audit_id=audit_id,
                             skill_name=skill_name,
                             status_code=resp.status,
-                            attempt=attempt,
                         )
                         return True
                     elif 400 <= resp.status < 500:
-                        # Client / contract errors should not be blindly retried
+                        # Client errors (e.g. 400, 401, 403, 404, 422) should not be retried
                         logger.warning(
                             "evidence_persistence_client_error",
                             audit_id=audit_id,
-                            skill_name=skill_name,
-                            status_code=resp.status,
+                            status=resp.status,
                         )
                         return False
                     else:
+                        # Server errors (5xx) or transient statuses
                         logger.warning(
                             "evidence_persistence_server_error",
                             audit_id=audit_id,
-                            skill_name=skill_name,
-                            status_code=resp.status,
+                            status=resp.status,
                             attempt=attempt,
                         )
         except asyncio.CancelledError:
@@ -198,22 +201,21 @@ async def notify_careervoice_signal(
             raise
         except Exception as e:
             logger.warning(
-                "evidence_persistence_network_error",
+                "evidence_persistence_attempt_failed",
                 audit_id=audit_id,
-                skill_name=skill_name,
                 attempt=attempt,
                 error=str(e),
             )
 
         if attempt < max_retries:
-            backoff = initial_backoff * (2 ** (attempt - 1))
             await asyncio.sleep(backoff)
+            backoff *= 2
 
     logger.error(
         "evidence_persistence_exhausted_retries",
         audit_id=audit_id,
         skill_name=skill_name,
-        attempts=max_retries,
+        max_retries=max_retries,
     )
     return False
 
@@ -226,10 +228,6 @@ def check_evidence_grounding(
     transcript_text: str,
     conversation_history: Optional[List[Dict[str, str]]] = None,
 ) -> bool:
-    """
-    Ensures evidenceSnippet is grounded in the candidate's actual spoken transcript.
-    Rejects hallucinations where the model invents quotes never spoken by the candidate.
-    """
     if not evidence_snippet or not evidence_snippet.strip():
         return False
 
@@ -259,10 +257,6 @@ def extract_evidence_provenance(
     latest_turn_text: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[str, List[Dict[str, Any]]]:
-    """
-    Extracts authentic candidate speech from relevant original turns supporting the evidence.
-    Returns (raw_answer_snippet, evidence_source_turns) without model paraphrasing.
-    """
     tokens = set(re.findall(r"\b[a-zA-Z0-9_\-\.\#\+\/]{3,}\b", evidence_snippet.lower()))
     stopwords = {"the", "and", "for", "with", "that", "this", "from", "built", "using", "project", "have", "were", "been", "where"}
     substantive_tokens = tokens - stopwords
@@ -282,7 +276,6 @@ def extract_evidence_provenance(
                         matched_turns.append({"turnIndex": turn_idx, "text": text})
                 turn_idx += 1
 
-    # Ensure latest turn is included if relevant or if no earlier turns matched
     latest_user_tokens = set(re.findall(r"\b[a-zA-Z0-9_\-\.\#\+\/]{3,}\b", latest_turn_text.lower()))
     if (latest_user_tokens & substantive_tokens) or not matched_turns:
         if not any(t["text"] == latest_turn_text for t in matched_turns):
@@ -301,17 +294,13 @@ async def evaluate_student_evidence_llm(
     conversation_history: Optional[List[Dict[str, str]]] = None,
     timeout_seconds: float = 6.0,
 ) -> Optional[EvidenceAssessment]:
-    """
-    Evaluates candidate conversational answer using structured LLM analysis.
-    Supports Gemini -> Anthropic -> OpenAI provider fallback.
-    Hardened against prompt injection: Candidate transcript is treated strictly as untrusted data.
-    """
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    openrouter_model = os.getenv("OPENROUTER_LLM_MODEL", "openai/gpt-4o-mini").strip()
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
     gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
 
-    # Bounded conversation context: recent 3-5 user/assistant turns
     bounded_history = []
     if conversation_history:
         relevant_turns = [m for m in conversation_history if m.get("role") in ("user", "assistant")]
@@ -360,7 +349,44 @@ Analyze the candidate transcript above according to the security and evaluation 
     try:
         raw_json_str = None
 
-        if gemini_key:
+        # 1. Primary: OpenRouter LLM Evaluation
+        if openrouter_key:
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {openrouter_key}",
+                "Content-Type": "application/json",
+                "HTTP-Referer": "https://careervoice.pathwisse.com",
+                "X-Title": "Pathwisse CareerVoice Agent",
+            }
+            payload = {
+                "model": openrouter_model,
+                "temperature": 0.1,
+                "response_format": {"type": "json_object"},
+                "messages": [
+                    {"role": "system", "content": system_instruction},
+                    {"role": "user", "content": user_prompt},
+                ],
+            }
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            choices = data.get("choices", [])
+                            if choices:
+                                raw_json_str = choices[0]["message"]["content"]
+                        else:
+                            logger.warning(f"openrouter_evidence_eval_api_error status={resp.status}")
+            except Exception as ore:
+                logger.warning(f"openrouter_evidence_eval_error: {ore}")
+
+        # 2. Fallback: Google Gemini
+        if not raw_json_str and gemini_key:
             url = f"https://generativelanguage.googleapis.com/v1beta/models/{gemini_model}:generateContent?key={gemini_key}"
             payload = {
                 "systemInstruction": {"parts": [{"text": system_instruction}]},
@@ -370,21 +396,25 @@ Analyze the candidate transcript above according to the security and evaluation 
                     "response_mime_type": "application/json",
                 },
             }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=timeout_seconds),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        candidates = data.get("candidates", [])
-                        if candidates:
-                            raw_json_str = candidates[0]["content"]["parts"][0]["text"]
-                    else:
-                        logger.warning("gemini_evidence_eval_api_error", status=resp.status)
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            candidates = data.get("candidates", [])
+                            if candidates:
+                                raw_json_str = candidates[0]["content"]["parts"][0]["text"]
+                        else:
+                            logger.warning(f"gemini_evidence_eval_api_error status={resp.status}")
+            except Exception as gme:
+                logger.warning(f"gemini_evidence_eval_error: {gme}")
 
-        elif anthropic_key:
+        # 3. Fallback: Anthropic Claude
+        if not raw_json_str and anthropic_key:
             url = "https://api.anthropic.com/v1/messages"
             headers = {
                 "x-api-key": anthropic_key,
@@ -398,20 +428,24 @@ Analyze the candidate transcript above according to the security and evaluation 
                 "system": system_instruction,
                 "messages": [{"role": "user", "content": user_prompt}],
             }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=timeout_seconds),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        content = data.get("content", [])
-                        if content:
-                            raw_json_str = content[0].get("text", "")
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            content = data.get("content", [])
+                            if content:
+                                raw_json_str = content[0].get("text", "")
+            except Exception as ace:
+                logger.warning(f"anthropic_evidence_eval_error: {ace}")
 
-        elif openai_key:
+        # 4. Fallback: OpenAI Direct
+        if not raw_json_str and openai_key:
             url = "https://api.openai.com/v1/chat/completions"
             headers = {"Authorization": f"Bearer {openai_key}"}
             payload = {
@@ -423,30 +457,29 @@ Analyze the candidate transcript above according to the security and evaluation 
                     {"role": "user", "content": user_prompt},
                 ],
             }
-            async with aiohttp.ClientSession() as session:
-                async with session.post(
-                    url,
-                    headers=headers,
-                    json=payload,
-                    timeout=aiohttp.ClientTimeout(total=timeout_seconds),
-                ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        raw_json_str = data["choices"][0]["message"]["content"]
+            try:
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(
+                        url,
+                        headers=headers,
+                        json=payload,
+                        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            raw_json_str = data["choices"][0]["message"]["content"]
+            except Exception as oae:
+                logger.warning(f"openai_evidence_eval_error: {oae}")
 
         if not raw_json_str:
             return None
 
-        # Parse JSON and strictly validate against Pydantic schema
         parsed_dict = json.loads(raw_json_str)
         assessment = EvidenceAssessment.model_validate(parsed_dict)
         return assessment
 
     except ValidationError as ve:
-        logger.warning(
-            "evidence_validation_failed",
-            validation_error=str(ve.errors()),
-        )
+        logger.warning("evidence_validation_failed", validation_error=str(ve.errors()))
         return None
     except json.JSONDecodeError as jde:
         logger.warning("evidence_malformed_json_error", error=str(jde))
@@ -463,24 +496,21 @@ Analyze the candidate transcript above according to the security and evaluation 
 # Non-Blocking FrameProcessor with Complete Task Lifecycle & Provenance Tracking
 # ==============================================================================
 class CareerVoiceEvidenceEvaluator(FrameProcessor):
-    """
-    Non-blocking pipeline processor that asynchronously evaluates candidate turns.
-    Immediately forwards frames downstream so realtime voice synthesis is never delayed.
-    Enforces bounded concurrency, turn deduplication, task tracking, and graceful persistence shutdown.
-    """
     def __init__(
         self,
         audit_id: str,
         target_role: str,
         student_name: str = "Candidate",
         student_id: Optional[str] = None,
+        user_id: Optional[str] = None,
         max_concurrent: int = 2,
     ):
         super().__init__()
         self.audit_id = audit_id
         self.target_role = target_role
         self.student_name = student_name
-        self.student_id = student_id
+        self.student_id = student_id or user_id
+        self.user_id = user_id or student_id
         self.last_follow_up: Optional[str] = None
         self._max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
@@ -490,13 +520,11 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
         self._turn_counter = 0
 
     def _track_task(self, task: asyncio.Task, task_set: Set[asyncio.Task]) -> asyncio.Task:
-        """Helper to track background tasks and automatically clean them up upon completion."""
         task_set.add(task)
         task.add_done_callback(task_set.discard)
         return task
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        # P0 Critical Requirement: Immediately push frame downstream (zero realtime voice latency)
         await super().process_frame(frame, direction)
         await self.push_frame(frame, direction)
 
@@ -511,7 +539,6 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                         self._turn_counter += 1
                         turn_idx = self._turn_counter
 
-                        # Schedule async evaluation without blocking pipeline
                         task = asyncio.create_task(
                             self._evaluate_turn_async(content, list(messages), turn_idx)
                         )
@@ -522,22 +549,13 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
         if len(words) < 2:
             return
 
-        # Bounded concurrency guard
         if self._semaphore.locked():
-            logger.info(
-                "evidence_evaluation_skipped_busy",
-                audit_id=self.audit_id,
-                turn_index=turn_idx,
-            )
+            logger.info("evidence_evaluation_skipped_busy", audit_id=self.audit_id, turn_index=turn_idx)
             return
 
         async with self._semaphore:
             start_eval = time.time()
-            logger.info(
-                "evidence_evaluation_started",
-                audit_id=self.audit_id,
-                turn_index=turn_idx,
-            )
+            logger.info("evidence_evaluation_started", audit_id=self.audit_id, turn_index=turn_idx)
 
             try:
                 assessment = await evaluate_student_evidence_llm(
@@ -549,12 +567,7 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                 latency_ms = round((time.time() - start_eval) * 1000, 2)
 
                 if not assessment:
-                    logger.info(
-                        "evidence_evaluation_failed",
-                        audit_id=self.audit_id,
-                        turn_index=turn_idx,
-                        eval_latency_ms=latency_ms,
-                    )
+                    logger.info("evidence_evaluation_failed", audit_id=self.audit_id, turn_index=turn_idx, eval_latency_ms=latency_ms)
                     return
 
                 logger.info(
@@ -567,7 +580,6 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                 )
 
                 if assessment.evidenceFound:
-                    # Grounding check: verify snippet actually aligns with candidate speech
                     is_grounded = check_evidence_grounding(
                         assessment.evidenceSnippet or "",
                         answer_text,
@@ -575,21 +587,15 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                     )
 
                     if not is_grounded:
-                        logger.warning(
-                            "evidence_grounding_failed",
-                            audit_id=self.audit_id,
-                            snippet=assessment.evidenceSnippet,
-                        )
+                        logger.warning("evidence_grounding_failed", audit_id=self.audit_id, snippet=assessment.evidenceSnippet)
                         return
 
-                    # Provenance extraction: extract authentic original turns and text
                     raw_provenance_snippet, source_turns = extract_evidence_provenance(
                         assessment.evidenceSnippet or "",
                         answer_text,
                         conversation_history,
                     )
 
-                    # Spawn tracked persistence task with grace period on shutdown
                     persist_task = asyncio.create_task(
                         notify_careervoice_signal(
                             audit_id=self.audit_id,
@@ -598,8 +604,8 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                             confidence_score=int(assessment.confidenceScore),
                             evidence_strength=str(assessment.evidenceStrength),
                             raw_answer=raw_provenance_snippet,
+                            user_id=self.student_id or self.user_id,
                             source_turns=source_turns,
-                            user_id=self.student_id,
                         )
                     )
                     self._track_task(persist_task, self._persistence_tasks)
@@ -614,41 +620,31 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                         )
             except Exception as e:
                 latency_ms = round((time.time() - start_eval) * 1000, 2)
-                logger.warning(
-                    "evidence_evaluation_error",
-                    audit_id=self.audit_id,
-                    error=str(e),
-                    eval_latency_ms=latency_ms,
-                )
+                logger.warning("evidence_evaluation_error", audit_id=self.audit_id, error=str(e), eval_latency_ms=latency_ms)
 
-    async def shutdown(self, persistence_grace_seconds: float = 2.5):
-        """
-        Graceful session shutdown:
-        1. Immediately cancels active evaluation tasks and properly awaits their termination.
-        2. Waits up to persistence_grace_seconds for pending persistence webhook tasks.
-        3. Cancels and awaits any remaining persistence tasks exceeding timeout.
-        4. Cleans up all tracked task sets so zero orphan tasks remain.
-        """
-        # 1. Cancel evaluation tasks immediately and await them
-        eval_tasks = list(self._evaluation_tasks)
-        for task in eval_tasks:
-            if not task.done():
-                task.cancel()
-        if eval_tasks:
-            await asyncio.gather(*eval_tasks, return_exceptions=True)
+    async def shutdown(self, evaluation_grace_seconds: float = 3.0, persistence_grace_seconds: float = 2.5):
+        # 1. Allow in-flight evaluations to complete within bounded grace period
+        if self._evaluation_tasks:
+            pending_eval = list(self._evaluation_tasks)
+            try:
+                done_eval, unfinished_eval = await asyncio.wait(pending_eval, timeout=evaluation_grace_seconds)
+                if unfinished_eval:
+                    logger.warning("evidence_evaluation_shutdown_timeout", count=len(unfinished_eval), audit_id=self.audit_id)
+                    for t in unfinished_eval:
+                        if not t.done():
+                            t.cancel()
+                    await asyncio.gather(*unfinished_eval, return_exceptions=True)
+            except Exception as e:
+                logger.warning("evidence_evaluation_shutdown_error", error=str(e))
         self._evaluation_tasks.clear()
 
-        # 2. Wait for persistence tasks to complete within grace period
+        # 2. Allow persistence tasks to complete within bounded grace period
         if self._persistence_tasks:
             pending = list(self._persistence_tasks)
             try:
                 done, unfinished = await asyncio.wait(pending, timeout=persistence_grace_seconds)
                 if unfinished:
-                    logger.warning(
-                        "evidence_persistence_shutdown_timeout",
-                        count=len(unfinished),
-                        audit_id=self.audit_id,
-                    )
+                    logger.warning("evidence_persistence_shutdown_timeout", count=len(unfinished), audit_id=self.audit_id)
                     for t in unfinished:
                         if not t.done():
                             t.cancel()
@@ -659,103 +655,143 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
 
 
 # ==============================================================================
-# LLM Service Factory
+# STT Service Factory with Fallback
 # ==============================================================================
-def create_llm_service(provider_preference: str = "gemini"):
-    """
-    Instantiates the configured LLM provider service based on availability.
-    Order of selection:
-    1. Google Gemini (configured model via GEMINI_MODEL, defaults to gemini-3.6-flash)
-    2. Anthropic Claude 3.5 Sonnet
-    3. OpenAI GPT-4o-mini
-    """
+def create_stt_service():
+    deepgram_key = os.getenv("DEEPGRAM_API_KEY", "").strip()
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    openrouter_model = os.getenv("OPENROUTER_STT_MODEL", "openai/whisper-large-v3").strip()
+
+    if deepgram_key:
+        logger.info("Initializing Deepgram as Primary STT")
+        return DeepgramSTTService(api_key=deepgram_key)
+    elif openrouter_key:
+        logger.info(f"Initializing OpenRouter STT Service (model={openrouter_model})")
+        return OpenRouterSTTService(api_key=openrouter_key, model=openrouter_model)
+    else:
+        raise RuntimeError(
+            "No usable STT provider is configured. One of DEEPGRAM_API_KEY or OPENROUTER_API_KEY must be set."
+        )
+
+
+# ==============================================================================
+# LLM Service Factory with Multi-Tier Fallback
+# ==============================================================================
+def create_llm_service(provider_preference: Optional[str] = None):
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    openrouter_model = os.getenv("OPENROUTER_LLM_MODEL", "openai/gpt-4o-mini").strip()
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
     gemini_model = os.getenv("GEMINI_MODEL", "gemini-3.6-flash").strip()
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
 
-    if gemini_key and provider_preference == "gemini":
-        logger.info("Initializing Google Gemini as Primary LLM", model=gemini_model)
-        return GoogleLLMService(
-            api_key=gemini_key,
-            model=gemini_model,
-        )
-    elif anthropic_key:
-        logger.info("Initializing Anthropic Claude as LLM", model="claude-3-5-sonnet-20241022")
-        return AnthropicLLMService(
-            api_key=anthropic_key,
-            model="claude-3-5-sonnet-20241022",
-        )
-    elif openai_key:
-        logger.info("Initializing OpenAI GPT-4o-mini as LLM", model="gpt-4o-mini")
+    pref = (provider_preference or os.getenv("LLM_PROVIDER", "openrouter")).strip().lower()
+
+    # 1. Explicit preferences first
+    if pref == "gemini" and gemini_key:
+        logger.info(f"Initializing Google Gemini as Preferred LLM (model={gemini_model})")
+        return GoogleLLMService(api_key=gemini_key, model=gemini_model)
+    elif pref == "anthropic" and anthropic_key:
+        logger.info("Initializing Anthropic Claude as Preferred LLM (model=claude-3-5-sonnet-20241022)")
+        return AnthropicLLMService(api_key=anthropic_key, model="claude-3-5-sonnet-20241022")
+    elif pref == "openai" and openai_key:
+        logger.info("Initializing OpenAI GPT-4o-mini as Preferred LLM (model=gpt-4o-mini)")
+        return OpenAILLMService(api_key=openai_key, model="gpt-4o-mini")
+    elif pref in ("openrouter", "auto") and openrouter_key:
+        logger.info(f"Initializing OpenRouter as Preferred LLM (model={openrouter_model})")
         return OpenAILLMService(
-            api_key=openai_key,
-            model="gpt-4o-mini",
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api/v1",
+            model=openrouter_model,
+        )
+
+    # 2. General Fallback Chain
+    if openrouter_key:
+        logger.info(f"Initializing OpenRouter as Fallback LLM (model={openrouter_model})")
+        return OpenAILLMService(
+            api_key=openrouter_key,
+            base_url="https://openrouter.ai/api/v1",
+            model=openrouter_model,
         )
     elif gemini_key:
-        logger.info("Initializing Google Gemini fallback", model=gemini_model)
-        return GoogleLLMService(
-            api_key=gemini_key,
-            model=gemini_model,
-        )
+        logger.info(f"Initializing Google Gemini as Fallback LLM (model={gemini_model})")
+        return GoogleLLMService(api_key=gemini_key, model=gemini_model)
+    elif anthropic_key:
+        logger.info("Initializing Anthropic Claude as Fallback LLM (model=claude-3-5-sonnet-20241022)")
+        return AnthropicLLMService(api_key=anthropic_key, model="claude-3-5-sonnet-20241022")
+    elif openai_key:
+        logger.info("Initializing OpenAI GPT-4o-mini as Fallback LLM (model=gpt-4o-mini)")
+        return OpenAILLMService(api_key=openai_key, model="gpt-4o-mini")
     else:
         raise RuntimeError(
-            "No usable LLM provider is configured. One of GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY must be set."
+            "No usable LLM provider is configured. One of OPENROUTER_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY must be set."
         )
 
 
-from services import FishAudioTTSService
-
-
 # ==============================================================================
-# TTS Service Factory
+# TTS Service Factory with Multi-Tier Fallback
 # ==============================================================================
 def create_tts_service(provider_preference: Optional[str] = None):
-    """
-    Instantiates the configured TTS provider based on availability and preference.
-    Supported:
-    1. Cartesia Sonic (CARTESIA_API_KEY)
-    2. Novita AI / Fish Audio S1 (NOVITA_API_KEY or FISH_AUDIO_API_KEY)
-    """
+    openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
+    openrouter_model = os.getenv("OPENROUTER_TTS_MODEL", "fish-audio/s2.1-pro").strip()
+    openrouter_voice = os.getenv("OPENROUTER_TTS_VOICE", "").strip() or None
     cartesia_key = os.getenv("CARTESIA_API_KEY", "").strip()
     novita_key = os.getenv("NOVITA_API_KEY", "").strip() or os.getenv("FISH_AUDIO_API_KEY", "").strip()
     novita_ref_id = os.getenv("FISH_AUDIO_REFERENCE_ID", "").strip() or None
-    tts_pref = (provider_preference or os.getenv("TTS_PROVIDER", "cartesia")).strip().lower()
 
-    if (tts_pref in ("novita", "fish", "fish_audio") or not cartesia_key) and novita_key:
-        logger.info("Initializing Novita Fish Audio TTS as TTS Provider", model="s1")
-        return FishAudioTTSService(
-            api_key=novita_key,
-            reference_id=novita_ref_id,
-            sample_rate=16000,
+    pref = (provider_preference or os.getenv("TTS_PROVIDER", "auto")).strip().lower()
+
+    openrouter_provider = None
+    if openrouter_key:
+        openrouter_provider = OpenRouterTTSService(
+            api_key=openrouter_key,
+            model=openrouter_model,
+            voice=openrouter_voice,
+            response_format="pcm",
+            sample_rate=44100,
         )
-    elif cartesia_key:
-        logger.info("Initializing Cartesia Sonic TTS as TTS Provider")
-        return CartesiaTTSService(
+
+    cartesia_provider = None
+    if cartesia_key:
+        cartesia_provider = CartesiaTTSService(
             api_key=cartesia_key,
             voice_id=os.getenv("CARTESIA_VOICE_ID", "79a125e8-cd45-4c13-8a67-188112f4dd22"),
         )
-    elif novita_key:
-        logger.info("Initializing Novita Fish Audio TTS fallback", model="s1")
-        return FishAudioTTSService(
+
+    novita_provider = None
+    if novita_key:
+        novita_provider = FishAudioTTSService(
             api_key=novita_key,
             reference_id=novita_ref_id,
             sample_rate=16000,
         )
-    else:
+
+    # Order providers according to preference
+    if pref == "cartesia":
+        ordered = [cartesia_provider, openrouter_provider, novita_provider]
+    elif pref in ("novita", "fish", "fish_audio"):
+        ordered = [novita_provider, openrouter_provider, cartesia_provider]
+    else:  # "openrouter", "auto", or default
+        ordered = [openrouter_provider, cartesia_provider, novita_provider]
+
+    providers = [p for p in ordered if p is not None]
+
+    if not providers:
         raise RuntimeError(
-            "No usable TTS provider is configured. One of CARTESIA_API_KEY or NOVITA_API_KEY must be set."
+            "No usable TTS provider is configured. One of OPENROUTER_API_KEY, CARTESIA_API_KEY, or NOVITA_API_KEY must be set."
         )
+
+    if len(providers) == 1:
+        return providers[0]
+
+    logger.info(f"Configured resilient FallbackTTSService with {len(providers)} providers (preferred: {pref})")
+    return FallbackTTSService(providers=providers, sample_rate=24000)
 
 
 # ==============================================================================
 # Voice Agent Pipeline Runner
 # ==============================================================================
 async def run_careervoice_agent(session_config: VoiceSessionConfig):
-    """
-    Executes a real-time conversational CareerVoice audit session using the specified transport (Daily or LiveKit).
-    The pipeline logic (VAD -> STT -> Evidence Evaluator -> LLM -> TTS -> WebRTC) is provider-agnostic.
-    """
     start_time = time.time()
     audit_id = session_config.audit_id
     provider_name = session_config.provider
@@ -773,7 +809,6 @@ async def run_careervoice_agent(session_config: VoiceSessionConfig):
     evidence_evaluator = None
 
     try:
-        # Resolve transport provider from abstraction factory
         provider = router.get_provider(provider_name)
         transport = provider.create_pipecat_transport(session_config)
 
@@ -784,20 +819,19 @@ async def run_careervoice_agent(session_config: VoiceSessionConfig):
             room_name=session_config.room_name,
         )
 
-        # STT & TTS Providers
-        stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
+        stt = create_stt_service()
         tts = create_tts_service()
-
         llm = create_llm_service()
 
-        system_instruction = f"""You are Qalam, Pathwisse CareerVoice's lead AI Career Auditor.
-You are conducting a strict, encouraging, and evidence-focused 1-on-1 career audit with {student_name} for the role: "{target_role}".
+        system_instruction = f"""You are Qalam, Pathwisse CareerVoice's lead AI Career Auditor and Mentor.
+You are conducting an interactive, evidence-focused 1-on-1 career audit with {student_name} for the role: "{target_role}".
 
 Rules:
 1. Speak in short, concise conversational turns (1-3 sentences max).
 2. Probe for concrete evidence: ask for specific tools, architecture, algorithms, or code trade-offs.
 3. Detect weak evidence: if the candidate says "I know React" or "I studied Python", ask them to explain an actual project or bug they solved.
-4. Keep tone warm, professional, and analytical.
+4. Career Guidance & Role Inquiries: If the candidate asks what a {target_role} does day-to-day, what salaries/packages look like, or how this track compares to others, provide a crisp, realistic, encouraging explanation tailored to the Indian tech industry, then invite them to share their project experience.
+5. Keep tone warm, empathetic, professional, and analytical.
 """
 
         messages = [
@@ -811,14 +845,16 @@ Rules:
         tma_in = LLMUserResponseAggregator(messages)
         tma_out = LLMAssistantResponseAggregator(messages)
 
+        resolved_student_id = session_config.student_id or session_config.user_id
+
         evidence_evaluator = CareerVoiceEvidenceEvaluator(
             audit_id=audit_id,
             target_role=target_role,
             student_name=student_name,
-            student_id=session_config.student_id or session_config.user_id,
+            student_id=resolved_student_id,
+            user_id=resolved_student_id,
         )
 
-        # Provider-independent pipeline with non-blocking evidence evaluator
         pipeline = Pipeline(
             [
                 transport.input(),
@@ -870,25 +906,24 @@ Rules:
 
 if __name__ == "__main__":
     if len(sys.argv) < 5:
-        print("Usage: python bot.py <provider: daily|livekit> <room_url> <token> <audit_id> <target_role> [student_name] [room_name]")
+        print("Usage: python bot.py <audit_id> <target_role> <student_name> <provider> [room_url] [token]")
         sys.exit(1)
 
-    prov = sys.argv[1]
-    r_url = sys.argv[2]
-    tkn = sys.argv[3]
-    aud_id = sys.argv[4]
-    role = sys.argv[5] if len(sys.argv) > 5 else "Software Engineer"
-    name = sys.argv[6] if len(sys.argv) > 6 else "Candidate"
-    r_name = sys.argv[7] if len(sys.argv) > 7 else f"careervoice-{aud_id}"
+    _audit_id = sys.argv[1]
+    _target_role = sys.argv[2]
+    _student_name = sys.argv[3]
+    _provider = sys.argv[4]
+    _room_url = sys.argv[5] if len(sys.argv) > 5 else ""
+    _token = sys.argv[6] if len(sys.argv) > 6 else ""
 
-    cfg = VoiceSessionConfig(
-        audit_id=aud_id,
-        target_role=role,
-        student_name=name,
-        provider=prov,
-        room_url=r_url,
-        room_name=r_name,
-        token=tkn,
+    config = VoiceSessionConfig(
+        audit_id=_audit_id,
+        target_role=_target_role,
+        student_name=_student_name,
+        provider=_provider,
+        room_url=_room_url,
+        token=_token,
+        connection_url=_room_url,
     )
 
-    asyncio.run(run_careervoice_agent(cfg))
+    asyncio.run(run_careervoice_agent(config))

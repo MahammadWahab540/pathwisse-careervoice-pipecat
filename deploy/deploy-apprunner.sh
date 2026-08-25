@@ -115,6 +115,7 @@ resolve_secret_arn() {
 }
 
 SERVICE_TOKEN_ARN=$(resolve_secret_arn "careervoice/service-token")
+OPENROUTER_ARN=$(resolve_secret_arn "careervoice/openrouter-api-key")
 DEEPGRAM_ARN=$(resolve_secret_arn "careervoice/deepgram-api-key")
 CARTESIA_ARN=$(resolve_secret_arn "careervoice/cartesia-api-key")
 NOVITA_ARN=$(resolve_secret_arn "careervoice/novita-api-key")
@@ -135,13 +136,19 @@ OPENAI_ARN=$(resolve_secret_arn "careervoice/openai-api-key")
 # Validate required production secrets
 MISSING_REQUIRED=0
 if [ -z "$SERVICE_TOKEN_ARN" ]; then echo "ERROR: Missing required secret: careervoice/service-token"; MISSING_REQUIRED=1; fi
-if [ -z "$DEEPGRAM_ARN" ]; then echo "ERROR: Missing required secret: careervoice/deepgram-api-key"; MISSING_REQUIRED=1; fi
-if [ -z "$CARTESIA_ARN" ] && [ -z "$NOVITA_ARN" ]; then
-  echo "ERROR: At least one TTS provider secret must exist (careervoice/cartesia-api-key or careervoice/novita-api-key)."
+
+if [ -z "$DEEPGRAM_ARN" ] && [ -z "$OPENROUTER_ARN" ]; then
+  echo "ERROR: Missing required STT secret: careervoice/deepgram-api-key or careervoice/openrouter-api-key"
   MISSING_REQUIRED=1
 fi
-if [ -z "$GEMINI_ARN" ] && [ -z "$ANTHROPIC_ARN" ] && [ -z "$OPENAI_ARN" ]; then
-  echo "ERROR: At least one LLM provider secret must exist (careervoice/gemini-api-key, careervoice/anthropic-api-key, or careervoice/openai-api-key)."
+
+if [ -z "$OPENROUTER_ARN" ] && [ -z "$CARTESIA_ARN" ] && [ -z "$NOVITA_ARN" ]; then
+  echo "ERROR: Missing required TTS secret: careervoice/openrouter-api-key, careervoice/cartesia-api-key, or careervoice/novita-api-key"
+  MISSING_REQUIRED=1
+fi
+
+if [ -z "$OPENROUTER_ARN" ] && [ -z "$GEMINI_ARN" ] && [ -z "$ANTHROPIC_ARN" ] && [ -z "$OPENAI_ARN" ]; then
+  echo "ERROR: Missing required LLM secret: careervoice/openrouter-api-key or careervoice/gemini-api-key"
   MISSING_REQUIRED=1
 fi
 
@@ -155,44 +162,37 @@ elif [ -n "$LIVEKIT_URL_ARN" ] || [ -n "$LIVEKIT_KEY_ARN" ] || [ -n "$LIVEKIT_SE
   echo "WARNING: Partial LiveKit configuration detected. LiveKit transport disabled."
 fi
 
-if [ $HAS_DAILY -eq 0 ] && [ $HAS_LIVEKIT -eq 0 ]; then
-  echo "ERROR: At least one transport (Daily or fully configured LiveKit) must have required secrets configured."
+if [ "$HAS_DAILY" -eq 0 ] && [ "$HAS_LIVEKIT" -eq 0 ]; then
+  echo "ERROR: At least one transport (Daily or fully configured LiveKit) must have all required secrets configured."
   MISSING_REQUIRED=1
 fi
 
-if [ $MISSING_REQUIRED -ne 0 ]; then
-  echo "Deployment halted due to missing required AWS Secrets Manager entries."
+if [ "$MISSING_REQUIRED" -eq 1 ]; then
+  echo "Deployment halted due to missing required AWS Secrets Manager entries." >&2
   exit 1
 fi
 
-# Build RuntimeEnvironmentSecrets JSON with resolved real ARNs
-SECRETS_JSON="\"CAREERVOICE_SERVICE_TOKEN\": \"${SERVICE_TOKEN_ARN}\", \"DEEPGRAM_API_KEY\": \"${DEEPGRAM_ARN}\""
+SECRETS_LIST=()
+SECRETS_LIST+=("\"CAREERVOICE_SERVICE_TOKEN\": \"$SERVICE_TOKEN_ARN\"")
 
-if [ -n "$CARTESIA_ARN" ]; then
-  SECRETS_JSON="${SECRETS_JSON}, \"CARTESIA_API_KEY\": \"${CARTESIA_ARN}\""
+if [ -n "$OPENROUTER_ARN" ]; then SECRETS_LIST+=("\"OPENROUTER_API_KEY\": \"$OPENROUTER_ARN\""); fi
+if [ -n "$DEEPGRAM_ARN" ]; then SECRETS_LIST+=("\"DEEPGRAM_API_KEY\": \"$DEEPGRAM_ARN\""); fi
+if [ -n "$CARTESIA_ARN" ]; then SECRETS_LIST+=("\"CARTESIA_API_KEY\": \"$CARTESIA_ARN\""); fi
+if [ -n "$NOVITA_ARN" ]; then SECRETS_LIST+=("\"NOVITA_API_KEY\": \"$NOVITA_ARN\""); fi
+if [ -n "$FISH_REF_ID_ARN" ]; then SECRETS_LIST+=("\"FISH_AUDIO_REFERENCE_ID\": \"$FISH_REF_ID_ARN\""); fi
+if [ -n "$GEMINI_ARN" ]; then SECRETS_LIST+=("\"GEMINI_API_KEY\": \"$GEMINI_ARN\""); fi
+if [ -n "$DAILY_ARN" ]; then SECRETS_LIST+=("\"DAILY_API_KEY\": \"$DAILY_ARN\""); fi
+if [ "$HAS_LIVEKIT" -eq 1 ]; then
+  SECRETS_LIST+=("\"LIVEKIT_URL\": \"$LIVEKIT_URL_ARN\"")
+  SECRETS_LIST+=("\"LIVEKIT_API_KEY\": \"$LIVEKIT_KEY_ARN\"")
+  SECRETS_LIST+=("\"LIVEKIT_API_SECRET\": \"$LIVEKIT_SECRET_ARN\"")
 fi
-if [ -n "$NOVITA_ARN" ]; then
-  SECRETS_JSON="${SECRETS_JSON}, \"NOVITA_API_KEY\": \"${NOVITA_ARN}\""
-fi
-if [ -n "$FISH_REF_ID_ARN" ]; then
-  SECRETS_JSON="${SECRETS_JSON}, \"FISH_AUDIO_REFERENCE_ID\": \"${FISH_REF_ID_ARN}\""
-fi
-if [ -n "$GEMINI_ARN" ]; then
-  SECRETS_JSON="${SECRETS_JSON}, \"GEMINI_API_KEY\": \"${GEMINI_ARN}\""
-fi
+if [ -n "$ANTHROPIC_ARN" ]; then SECRETS_LIST+=("\"ANTHROPIC_API_KEY\": \"$ANTHROPIC_ARN\""); fi
+if [ -n "$OPENAI_ARN" ]; then SECRETS_LIST+=("\"OPENAI_API_KEY\": \"$OPENAI_ARN\""); fi
 
-if [ -n "$DAILY_ARN" ]; then
-  SECRETS_JSON="${SECRETS_JSON}, \"DAILY_API_KEY\": \"${DAILY_ARN}\""
-fi
-if [ $HAS_LIVEKIT -eq 1 ]; then
-  SECRETS_JSON="${SECRETS_JSON}, \"LIVEKIT_URL\": \"${LIVEKIT_URL_ARN}\", \"LIVEKIT_API_KEY\": \"${LIVEKIT_KEY_ARN}\", \"LIVEKIT_API_SECRET\": \"${LIVEKIT_SECRET_ARN}\""
-fi
-if [ -n "$ANTHROPIC_ARN" ]; then
-  SECRETS_JSON="${SECRETS_JSON}, \"ANTHROPIC_API_KEY\": \"${ANTHROPIC_ARN}\""
-fi
-if [ -n "$OPENAI_ARN" ]; then
-  SECRETS_JSON="${SECRETS_JSON}, \"OPENAI_API_KEY\": \"${OPENAI_ARN}\""
-fi
+IFS=,
+SECRETS_JSON="${SECRETS_LIST[*]}"
+unset IFS
 
 echo "✓ All required AWS Secrets successfully verified and resolved."
 

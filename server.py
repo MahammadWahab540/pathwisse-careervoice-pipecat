@@ -118,20 +118,23 @@ def readiness_check(response: Response):
     service_token_ok = bool(os.getenv("CAREERVOICE_SERVICE_TOKEN", "").strip())
     auth_ok = service_token_ok if app_env == "production" else True
 
+    openrouter_key = bool(os.getenv("OPENROUTER_API_KEY", "").strip())
     deepgram_ok = bool(os.getenv("DEEPGRAM_API_KEY", "").strip())
+    stt_ok = deepgram_ok or openrouter_key
+
     cartesia_ok = bool(os.getenv("CARTESIA_API_KEY", "").strip())
     novita_ok = bool(os.getenv("NOVITA_API_KEY", "").strip() or os.getenv("FISH_AUDIO_API_KEY", "").strip())
-    tts_ok = cartesia_ok or novita_ok
+    tts_ok = openrouter_key or cartesia_ok or novita_ok
 
     gemini_ok = bool(os.getenv("GEMINI_API_KEY", "").strip())
     anthropic_ok = bool(os.getenv("ANTHROPIC_API_KEY", "").strip())
     openai_ok = bool(os.getenv("OPENAI_API_KEY", "").strip())
-    llm_ok = gemini_ok or anthropic_ok or openai_ok
+    llm_ok = openrouter_key or gemini_ok or anthropic_ok or openai_ok
 
     transport_status = router.get_readiness_status()
     has_any_transport = any(t["configured"] for t in transport_status.values())
 
-    is_ready = has_any_transport and llm_ok and deepgram_ok and tts_ok and auth_ok
+    is_ready = has_any_transport and llm_ok and stt_ok and tts_ok and auth_ok
 
     if not is_ready:
         response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
@@ -143,6 +146,10 @@ def readiness_check(response: Response):
         "defaultTransport": router.default_transport,
         "fallbackTransport": router.fallback_transport,
         "providers": {
+            "openrouter": openrouter_key,
+            "openrouterLlm": openrouter_key,
+            "openrouterTts": openrouter_key,
+            "openrouterStt": openrouter_key,
             "deepgram": deepgram_ok,
             "cartesia": cartesia_ok,
             "novitaFish": novita_ok,
