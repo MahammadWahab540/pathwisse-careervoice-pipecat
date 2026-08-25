@@ -132,7 +132,10 @@ def readiness_check(response: Response):
     llm_ok = openrouter_key or gemini_ok or anthropic_ok or openai_ok
 
     transport_status = router.get_readiness_status()
-    has_any_transport = any(t["configured"] for t in transport_status.values())
+    daily_ok = transport_status.get("daily", {}).get("configured", False)
+    livekit_ok = transport_status.get("livekit", {}).get("configured", False)
+    default_is_ws = router.default_transport == "websocket"
+    has_any_transport = daily_ok or livekit_ok or (default_is_ws and transport_status.get("websocket", {}).get("configured", False))
 
     is_ready = has_any_transport and llm_ok and stt_ok and tts_ok and auth_ok
 

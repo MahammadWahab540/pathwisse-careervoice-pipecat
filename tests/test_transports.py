@@ -521,19 +521,20 @@ async def test_websocket_provision_session_success():
 
 def test_start_session_endpoint_with_websocket_transport():
     with patch.dict(os.environ, {"CAREERVOICE_SERVICE_TOKEN": "test-service-token"}):
-        response = client.post(
-            "/api/voice/session",
-            json={
-                "auditId": "audit_direct_ws_01",
-                "targetRole": "Backend Developer",
-                "studentName": "Alex",
-                "transport": "websocket",
-            },
-            headers={"Authorization": "Bearer test-service-token"},
-        )
-        assert response.status_code == 200
-        data = response.json()
-        assert data["success"] is True
-        assert data["provider"] == "websocket"
-        assert "/ws/voice/audit_direct_ws_01" in data["connection"]["url"]
+        with patch("server.run_careervoice_agent", new_callable=AsyncMock):
+            response = client.post(
+                "/api/voice/session",
+                json={
+                    "auditId": "audit_direct_ws_01",
+                    "targetRole": "Backend Developer",
+                    "studentName": "Alex",
+                    "transport": "websocket",
+                },
+                headers={"Authorization": "Bearer test-service-token"},
+            )
+            assert response.status_code == 200
+            data = response.json()
+            assert data["success"] is True
+            assert data["provider"] == "websocket"
+            assert "/ws/voice/audit_direct_ws_01" in data["connection"]["url"]
 
