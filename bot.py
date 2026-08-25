@@ -687,44 +687,41 @@ def create_llm_service(provider_preference: Optional[str] = None):
 
     pref = (provider_preference or os.getenv("LLM_PROVIDER", "openrouter")).strip().lower()
 
-    if openrouter_key and (pref in ("openrouter", "auto") or not (gemini_key or anthropic_key or openai_key)):
-        logger.info(f"Initializing OpenRouter as Primary LLM (model={openrouter_model})")
+    # 1. Explicit preferences first
+    if pref == "gemini" and gemini_key:
+        logger.info(f"Initializing Google Gemini as Preferred LLM (model={gemini_model})")
+        return GoogleLLMService(api_key=gemini_key, model=gemini_model)
+    elif pref == "anthropic" and anthropic_key:
+        logger.info("Initializing Anthropic Claude as Preferred LLM (model=claude-3-5-sonnet-20241022)")
+        return AnthropicLLMService(api_key=anthropic_key, model="claude-3-5-sonnet-20241022")
+    elif pref == "openai" and openai_key:
+        logger.info("Initializing OpenAI GPT-4o-mini as Preferred LLM (model=gpt-4o-mini)")
+        return OpenAILLMService(api_key=openai_key, model="gpt-4o-mini")
+    elif pref in ("openrouter", "auto") and openrouter_key:
+        logger.info(f"Initializing OpenRouter as Preferred LLM (model={openrouter_model})")
         return OpenAILLMService(
             api_key=openrouter_key,
             base_url="https://openrouter.ai/api/v1",
             model=openrouter_model,
         )
-    elif gemini_key and pref == "gemini":
-        logger.info(f"Initializing Google Gemini as Primary LLM (model={gemini_model})")
-        return GoogleLLMService(
-            api_key=gemini_key,
-            model=gemini_model,
-        )
-    elif openrouter_key:
-        logger.info(f"Initializing OpenRouter as LLM fallback (model={openrouter_model})")
+
+    # 2. General Fallback Chain
+    if openrouter_key:
+        logger.info(f"Initializing OpenRouter as Fallback LLM (model={openrouter_model})")
         return OpenAILLMService(
             api_key=openrouter_key,
             base_url="https://openrouter.ai/api/v1",
             model=openrouter_model,
         )
     elif gemini_key:
-        logger.info(f"Initializing Google Gemini as LLM fallback (model={gemini_model})")
-        return GoogleLLMService(
-            api_key=gemini_key,
-            model=gemini_model,
-        )
+        logger.info(f"Initializing Google Gemini as Fallback LLM (model={gemini_model})")
+        return GoogleLLMService(api_key=gemini_key, model=gemini_model)
     elif anthropic_key:
-        logger.info("Initializing Anthropic Claude as LLM fallback (model=claude-3-5-sonnet-20241022)")
-        return AnthropicLLMService(
-            api_key=anthropic_key,
-            model="claude-3-5-sonnet-20241022",
-        )
+        logger.info("Initializing Anthropic Claude as Fallback LLM (model=claude-3-5-sonnet-20241022)")
+        return AnthropicLLMService(api_key=anthropic_key, model="claude-3-5-sonnet-20241022")
     elif openai_key:
-        logger.info("Initializing OpenAI GPT-4o-mini as LLM fallback (model=gpt-4o-mini)")
-        return OpenAILLMService(
-            api_key=openai_key,
-            model="gpt-4o-mini",
-        )
+        logger.info("Initializing OpenAI GPT-4o-mini as Fallback LLM (model=gpt-4o-mini)")
+        return OpenAILLMService(api_key=openai_key, model="gpt-4o-mini")
     else:
         raise RuntimeError(
             "No usable LLM provider is configured. One of OPENROUTER_API_KEY, GEMINI_API_KEY, ANTHROPIC_API_KEY, or OPENAI_API_KEY must be set."
@@ -742,38 +739,42 @@ def create_tts_service(provider_preference: Optional[str] = None):
     novita_key = os.getenv("NOVITA_API_KEY", "").strip() or os.getenv("FISH_AUDIO_API_KEY", "").strip()
     novita_ref_id = os.getenv("FISH_AUDIO_REFERENCE_ID", "").strip() or None
 
-    providers = []
+    pref = (provider_preference or os.getenv("TTS_PROVIDER", "auto")).strip().lower()
 
+    openrouter_provider = None
     if openrouter_key:
-        logger.info(f"Adding OpenRouter TTS to provider chain [model={openrouter_model}, voice={openrouter_voice}]")
-        providers.append(
-            OpenRouterTTSService(
-                api_key=openrouter_key,
-                model=openrouter_model,
-                voice=openrouter_voice,
-                response_format="pcm",
-                sample_rate=44100,
-            )
+        openrouter_provider = OpenRouterTTSService(
+            api_key=openrouter_key,
+            model=openrouter_model,
+            voice=openrouter_voice,
+            response_format="pcm",
+            sample_rate=44100,
         )
 
+    cartesia_provider = None
     if cartesia_key:
-        logger.info("Adding Cartesia Sonic TTS to provider chain")
-        providers.append(
-            CartesiaTTSService(
-                api_key=cartesia_key,
-                voice_id=os.getenv("CARTESIA_VOICE_ID", "79a125e8-cd45-4c13-8a67-188112f4dd22"),
-            )
+        cartesia_provider = CartesiaTTSService(
+            api_key=cartesia_key,
+            voice_id=os.getenv("CARTESIA_VOICE_ID", "79a125e8-cd45-4c13-8a67-188112f4dd22"),
         )
 
+    novita_provider = None
     if novita_key:
-        logger.info("Adding Novita Fish Audio TTS to provider chain (model=s1)")
-        providers.append(
-            FishAudioTTSService(
-                api_key=novita_key,
-                reference_id=novita_ref_id,
-                sample_rate=16000,
-            )
+        novita_provider = FishAudioTTSService(
+            api_key=novita_key,
+            reference_id=novita_ref_id,
+            sample_rate=16000,
         )
+
+    # Order providers according to preference
+    if pref == "cartesia":
+        ordered = [cartesia_provider, openrouter_provider, novita_provider]
+    elif pref in ("novita", "fish", "fish_audio"):
+        ordered = [novita_provider, openrouter_provider, cartesia_provider]
+    else:  # "openrouter", "auto", or default
+        ordered = [openrouter_provider, cartesia_provider, novita_provider]
+
+    providers = [p for p in ordered if p is not None]
 
     if not providers:
         raise RuntimeError(
@@ -783,7 +784,7 @@ def create_tts_service(provider_preference: Optional[str] = None):
     if len(providers) == 1:
         return providers[0]
 
-    logger.info(f"Configured resilient FallbackTTSService with {len(providers)} providers")
+    logger.info(f"Configured resilient FallbackTTSService with {len(providers)} providers (preferred: {pref})")
     return FallbackTTSService(providers=providers, sample_rate=24000)
 
 

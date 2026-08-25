@@ -3,24 +3,33 @@ import io
 import wave
 import time
 import base64
-from typing import Optional, AsyncGenerator
+from typing import Optional, AsyncGenerator, List
 import aiohttp
 from loguru import logger
 
-from pipecat.services.ai_services import STTService
+try:
+    from pipecat.services.ai_services import SegmentedSTTService as _BaseSTTClass
+except ImportError:
+    from pipecat.services.ai_services import STTService as _BaseSTTClass
+
+from pipecat.processors.frame_processor import FrameDirection
 from pipecat.frames.frames import (
     Frame,
     TranscriptionFrame,
     InterimTranscriptionFrame,
     ErrorFrame,
     AudioRawFrame,
+    UserAudioRawFrame,
+    UserStartedSpeakingFrame,
+    UserStoppedSpeakingFrame,
 )
 
 
-class OpenRouterSTTService(STTService):
+class OpenRouterSTTService(_BaseSTTClass):
     """
-    OpenRouter Speech-to-Text Service implementation for Pipecat.
-    Transcribes audio using OpenRouter's OpenAI-compatible /api/v1/audio/transcriptions endpoint.
+    OpenRouter Segmented Speech-to-Text Service for Pipecat.
+    Buffers audio frames between VAD speaking start/stop boundaries and transcribes
+    complete utterances via OpenRouter's OpenAI-compatible /api/v1/audio/transcriptions endpoint.
     Supports Whisper models (e.g. openai/whisper-large-v3, openai/whisper-1).
     """
 
@@ -39,6 +48,8 @@ class OpenRouterSTTService(STTService):
         self._model = model or os.getenv("OPENROUTER_STT_MODEL", "openai/whisper-large-v3")
         self._language = language
         self._sample_rate = sample_rate
+        self._audio_buffer: bytearray = bytearray()
+        self._is_speaking: bool = False
 
     def is_configured(self) -> bool:
         return bool(self._api_key)
@@ -57,7 +68,7 @@ class OpenRouterSTTService(STTService):
 
     async def transcribe_audio_bytes(self, audio_bytes: bytes, audio_format: str = "wav") -> Optional[str]:
         """Direct transcription helper using Base64 JSON payload."""
-        if not self._api_key or not audio_bytes:
+        if not self._api_key or not audio_bytes or len(audio_bytes) < 320:
             return None
 
         headers = {
@@ -67,7 +78,6 @@ class OpenRouterSTTService(STTService):
             "X-Title": "Pathwisse CareerVoice Agent",
         }
 
-        # Ensure WAV container formatting
         formatted_audio = self._pcm_to_wav(audio_bytes) if audio_format == "wav" else audio_bytes
         b64_audio = base64.b64encode(formatted_audio).decode("utf-8")
 
@@ -101,15 +111,33 @@ class OpenRouterSTTService(STTService):
             return None
 
     async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
-        """Pipecat STT entrypoint implementing abstract STTService.run_stt."""
+        """Pipecat STT entrypoint implementing SegmentedSTTService.run_stt for complete utterances."""
         if not audio:
             return
 
         text = await self.transcribe_audio_bytes(audio, audio_format="wav")
         if text:
-            logger.debug(f"OpenRouter STT transcribed: {text}")
+            logger.debug(f"OpenRouter STT transcribed utterance: {text}")
             yield TranscriptionFrame(
                 text=text,
                 user_id="",
                 timestamp=str(time.time()),
             )
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection):
+        """Frame-level buffering fallback ensuring complete utterance aggregation."""
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, UserStartedSpeakingFrame):
+            self._is_speaking = True
+            self._audio_buffer.clear()
+        elif isinstance(frame, (AudioRawFrame, UserAudioRawFrame)) and self._is_speaking:
+            if hasattr(frame, "audio") and frame.audio:
+                self._audio_buffer.extend(frame.audio)
+        elif isinstance(frame, UserStoppedSpeakingFrame):
+            self._is_speaking = False
+            if len(self._audio_buffer) > 0:
+                audio_to_transcribe = bytes(self._audio_buffer)
+                self._audio_buffer.clear()
+                async for output_frame in self.run_stt(audio_to_transcribe):
+                    await self.push_frame(output_frame, direction)
