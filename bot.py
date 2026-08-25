@@ -496,11 +496,21 @@ Analyze the candidate transcript above according to the security and evaluation 
 # Non-Blocking FrameProcessor with Complete Task Lifecycle & Provenance Tracking
 # ==============================================================================
 class CareerVoiceEvidenceEvaluator(FrameProcessor):
-    def __init__(self, audit_id: str, target_role: str, student_name: str = "Candidate", max_concurrent: int = 2):
+    def __init__(
+        self,
+        audit_id: str,
+        target_role: str,
+        student_name: str = "Candidate",
+        student_id: Optional[str] = None,
+        user_id: Optional[str] = None,
+        max_concurrent: int = 2,
+    ):
         super().__init__()
         self.audit_id = audit_id
         self.target_role = target_role
         self.student_name = student_name
+        self.student_id = student_id or user_id
+        self.user_id = user_id or student_id
         self.last_follow_up: Optional[str] = None
         self._max_concurrent = max_concurrent
         self._semaphore = asyncio.Semaphore(max_concurrent)
@@ -594,6 +604,7 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                             confidence_score=int(assessment.confidenceScore),
                             evidence_strength=str(assessment.evidenceStrength),
                             raw_answer=raw_provenance_snippet,
+                            user_id=self.student_id or self.user_id,
                             source_turns=source_turns,
                         )
                     )
@@ -833,10 +844,14 @@ Rules:
         tma_in = LLMUserResponseAggregator(messages)
         tma_out = LLMAssistantResponseAggregator(messages)
 
+        resolved_student_id = session_config.student_id or session_config.user_id
+
         evidence_evaluator = CareerVoiceEvidenceEvaluator(
             audit_id=audit_id,
             target_role=target_role,
             student_name=student_name,
+            student_id=resolved_student_id,
+            user_id=resolved_student_id,
         )
 
         pipeline = Pipeline(

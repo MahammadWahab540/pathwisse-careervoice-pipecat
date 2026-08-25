@@ -1,4 +1,7 @@
 import os
+import io
+import wave
+import time
 import base64
 from typing import Optional, AsyncGenerator
 import aiohttp
@@ -40,6 +43,18 @@ class OpenRouterSTTService(STTService):
     def is_configured(self) -> bool:
         return bool(self._api_key)
 
+    def _pcm_to_wav(self, pcm_bytes: bytes) -> bytes:
+        """Encapsulates raw PCM bytes in a standard 16-bit mono WAV container."""
+        if pcm_bytes.startswith(b"RIFF"):
+            return pcm_bytes
+        wav_io = io.BytesIO()
+        with wave.open(wav_io, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(self._sample_rate)
+            wav_file.writeframes(pcm_bytes)
+        return wav_io.getvalue()
+
     async def transcribe_audio_bytes(self, audio_bytes: bytes, audio_format: str = "wav") -> Optional[str]:
         """Direct transcription helper using Base64 JSON payload."""
         if not self._api_key or not audio_bytes:
@@ -52,7 +67,10 @@ class OpenRouterSTTService(STTService):
             "X-Title": "Pathwisse CareerVoice Agent",
         }
 
-        b64_audio = base64.b64encode(audio_bytes).decode("utf-8")
+        # Ensure WAV container formatting
+        formatted_audio = self._pcm_to_wav(audio_bytes) if audio_format == "wav" else audio_bytes
+        b64_audio = base64.b64encode(formatted_audio).decode("utf-8")
+
         payload = {
             "model": self._model,
             "input_audio": {
@@ -81,3 +99,17 @@ class OpenRouterSTTService(STTService):
         except Exception as e:
             logger.error(f"OpenRouter STT request failed: {e}")
             return None
+
+    async def run_stt(self, audio: bytes) -> AsyncGenerator[Frame, None]:
+        """Pipecat STT entrypoint implementing abstract STTService.run_stt."""
+        if not audio:
+            return
+
+        text = await self.transcribe_audio_bytes(audio, audio_format="wav")
+        if text:
+            logger.debug(f"OpenRouter STT transcribed: {text}")
+            yield TranscriptionFrame(
+                text=text,
+                user_id="",
+                timestamp=str(time.time()),
+            )
