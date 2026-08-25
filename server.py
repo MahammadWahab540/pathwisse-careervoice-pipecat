@@ -31,6 +31,8 @@ class StartSessionRequest(BaseModel):
     auditId: str = Field(..., max_length=64, description="Unique CareerVoice audit session UUID")
     targetRole: str = Field(..., max_length=100, description="Target career role being audited")
     studentName: Optional[str] = Field(default="Candidate", max_length=100, description="Candidate first name")
+    studentId: Optional[str] = Field(default=None, max_length=64, description="Candidate UUID")
+    userId: Optional[str] = Field(default=None, max_length=64, description="Candidate UUID (alias)")
     transport: Optional[str] = Field(default=None, max_length=20, description="Optional transport: 'daily' | 'livekit'")
     # Backwards compatibility fields: existing callers that pre-provisioned Daily rooms
     roomUrl: Optional[str] = Field(default=None, max_length=256, description="Pre-provisioned Daily room URL (deprecated)")
@@ -185,6 +187,8 @@ async def start_voice_session(
         has_supplied_room=bool(req.roomUrl and req.token),
     )
 
+    student_id = (req.studentId or req.userId or "").strip() or None
+
     try:
         # Compatibility Path: If caller supplied an existing Daily room & token
         if req.roomUrl and req.token:
@@ -196,6 +200,8 @@ async def start_voice_session(
                 audit_id=audit_id,
                 target_role=target_role,
                 student_name=student_name,
+                student_id=student_id,
+                user_id=student_id,
                 provider="daily",
                 room_url=room_url,
                 room_name=room_name,
@@ -230,6 +236,8 @@ async def start_voice_session(
             audit_id=audit_id,
             target_role=target_role,
             student_name=student_name,
+            student_id=student_id,
+            user_id=student_id,
             provider=provision_result.provider,
             room_url=provision_result.room_url,
             room_name=provision_result.room_name,

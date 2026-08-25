@@ -34,8 +34,8 @@ from transports import router, VoiceSessionConfig
 CAREERVOICE_API_URL = os.getenv("CAREERVOICE_API_URL", "http://localhost:5000").rstrip("/")
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 OPENROUTER_LLM_MODEL = os.getenv("OPENROUTER_LLM_MODEL", "openai/gpt-4o-mini").strip()
-OPENROUTER_TTS_MODEL = os.getenv("OPENROUTER_TTS_MODEL", "openai/gpt-4o-mini-tts-2025-12-15").strip()
-OPENROUTER_TTS_VOICE = os.getenv("OPENROUTER_TTS_VOICE", "alloy").strip()
+OPENROUTER_TTS_MODEL = os.getenv("OPENROUTER_TTS_MODEL", "fish-audio/s2.1-pro").strip()
+OPENROUTER_TTS_VOICE = os.getenv("OPENROUTER_TTS_VOICE", "").strip()
 OPENROUTER_STT_MODEL = os.getenv("OPENROUTER_STT_MODEL", "openai/whisper-large-v3").strip()
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY", "").strip()
 CARTESIA_API_KEY = os.getenv("CARTESIA_API_KEY", "").strip()
@@ -72,11 +72,9 @@ class EvidenceAssessment(BaseModel):
 
     @model_validator(mode="after")
     def validate_assessment(self) -> "EvidenceAssessment":
-        # Rule 1: confidenceScore must be 0..100 if present
         if self.confidenceScore is not None and not (0 <= self.confidenceScore <= 100):
             raise ValueError(f"confidenceScore must be between 0 and 100, got {self.confidenceScore}")
 
-        # Rule 2: When evidenceFound == False -> no score, no level, strength must be insufficient, requiresFollowUp=True
         if not self.evidenceFound:
             if self.extractedLevel is not None:
                 raise ValueError("extractedLevel must be null when evidenceFound=false")
@@ -87,7 +85,6 @@ class EvidenceAssessment(BaseModel):
             if not self.requiresFollowUp:
                 raise ValueError("requiresFollowUp must be true when evidenceFound=false")
         else:
-            # Rule 3: When evidenceFound == True -> skillName, extractedLevel, confidenceScore, snippet required, requiresFollowUp=False
             if not self.skillName or not self.skillName.strip():
                 raise ValueError("skillName is required when evidenceFound=true")
             if not self.extractedLevel:
@@ -175,10 +172,6 @@ def check_evidence_grounding(
     transcript_text: str,
     conversation_history: Optional[List[Dict[str, str]]] = None,
 ) -> bool:
-    """
-    Ensures evidenceSnippet is grounded in the candidate's actual spoken transcript.
-    Rejects hallucinations where the model invents quotes never spoken by the candidate.
-    """
     if not evidence_snippet or not evidence_snippet.strip():
         return False
 
@@ -208,10 +201,6 @@ def extract_evidence_provenance(
     latest_turn_text: str,
     conversation_history: Optional[List[Dict[str, Any]]] = None,
 ) -> tuple[str, List[Dict[str, Any]]]:
-    """
-    Extracts authentic candidate speech from relevant original turns supporting the evidence.
-    Returns (raw_answer_snippet, evidence_source_turns) without model paraphrasing.
-    """
     tokens = set(re.findall(r"\b[a-zA-Z0-9_\-\.\#\+\/]{3,}\b", evidence_snippet.lower()))
     stopwords = {"the", "and", "for", "with", "that", "this", "from", "built", "using", "project", "have", "were", "been", "where"}
     substantive_tokens = tokens - stopwords
@@ -231,7 +220,6 @@ def extract_evidence_provenance(
                         matched_turns.append({"turnIndex": turn_idx, "text": text})
                 turn_idx += 1
 
-    # Ensure latest turn is included if relevant or if no earlier turns matched
     latest_user_tokens = set(re.findall(r"\b[a-zA-Z0-9_\-\.\#\+\/]{3,}\b", latest_turn_text.lower()))
     if (latest_user_tokens & substantive_tokens) or not matched_turns:
         if not any(t["text"] == latest_turn_text for t in matched_turns):
@@ -250,11 +238,6 @@ async def evaluate_student_evidence_llm(
     conversation_history: Optional[List[Dict[str, str]]] = None,
     timeout_seconds: float = 6.0,
 ) -> Optional[EvidenceAssessment]:
-    """
-    Evaluates candidate conversational answer using structured LLM analysis.
-    Supports Gemini -> Anthropic -> OpenAI provider fallback.
-    Hardened against prompt injection: Candidate transcript is treated strictly as untrusted data.
-    """
     openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     openrouter_model = os.getenv("OPENROUTER_LLM_MODEL", "openai/gpt-4o-mini").strip()
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -262,7 +245,6 @@ async def evaluate_student_evidence_llm(
     anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
     openai_key = os.getenv("OPENAI_API_KEY", "").strip()
 
-    # Bounded conversation context: recent 3-5 user/assistant turns
     bounded_history = []
     if conversation_history:
         relevant_turns = [m for m in conversation_history if m.get("role") in ("user", "assistant")]
@@ -436,16 +418,12 @@ Analyze the candidate transcript above according to the security and evaluation 
         if not raw_json_str:
             return None
 
-        # Parse JSON and strictly validate against Pydantic schema
         parsed_dict = json.loads(raw_json_str)
         assessment = EvidenceAssessment.model_validate(parsed_dict)
         return assessment
 
     except ValidationError as ve:
-        logger.warning(
-            "evidence_validation_failed",
-            validation_error=str(ve.errors()),
-        )
+        logger.warning("evidence_validation_failed", validation_error=str(ve.errors()))
         return None
     except json.JSONDecodeError as jde:
         logger.warning("evidence_malformed_json_error", error=str(jde))
@@ -462,11 +440,6 @@ Analyze the candidate transcript above according to the security and evaluation 
 # Non-Blocking FrameProcessor with Complete Task Lifecycle & Provenance Tracking
 # ==============================================================================
 class CareerVoiceEvidenceEvaluator(FrameProcessor):
-    """
-    Non-blocking pipeline processor that asynchronously evaluates candidate turns.
-    Immediately forwards frames downstream so realtime voice synthesis is never delayed.
-    Enforces bounded concurrency, turn deduplication, task tracking, and graceful persistence shutdown.
-    """
     def __init__(self, audit_id: str, target_role: str, student_name: str = "Candidate", max_concurrent: int = 2):
         super().__init__()
         self.audit_id = audit_id
@@ -481,13 +454,11 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
         self._turn_counter = 0
 
     def _track_task(self, task: asyncio.Task, task_set: Set[asyncio.Task]) -> asyncio.Task:
-        """Helper to track background tasks and automatically clean them up upon completion."""
         task_set.add(task)
         task.add_done_callback(task_set.discard)
         return task
 
     async def process_frame(self, frame: Frame, direction: FrameDirection):
-        # P0 Critical Requirement: Immediately push frame downstream (zero realtime voice latency)
         await super().process_frame(frame, direction)
         await self.push_frame(frame, direction)
 
@@ -502,7 +473,6 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                         self._turn_counter += 1
                         turn_idx = self._turn_counter
 
-                        # Schedule async evaluation without blocking pipeline
                         task = asyncio.create_task(
                             self._evaluate_turn_async(content, list(messages), turn_idx)
                         )
@@ -513,22 +483,13 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
         if len(words) < 2:
             return
 
-        # Bounded concurrency guard
         if self._semaphore.locked():
-            logger.info(
-                "evidence_evaluation_skipped_busy",
-                audit_id=self.audit_id,
-                turn_index=turn_idx,
-            )
+            logger.info("evidence_evaluation_skipped_busy", audit_id=self.audit_id, turn_index=turn_idx)
             return
 
         async with self._semaphore:
             start_eval = time.time()
-            logger.info(
-                "evidence_evaluation_started",
-                audit_id=self.audit_id,
-                turn_index=turn_idx,
-            )
+            logger.info("evidence_evaluation_started", audit_id=self.audit_id, turn_index=turn_idx)
 
             try:
                 assessment = await evaluate_student_evidence_llm(
@@ -540,12 +501,7 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                 latency_ms = round((time.time() - start_eval) * 1000, 2)
 
                 if not assessment:
-                    logger.info(
-                        "evidence_evaluation_failed",
-                        audit_id=self.audit_id,
-                        turn_index=turn_idx,
-                        eval_latency_ms=latency_ms,
-                    )
+                    logger.info("evidence_evaluation_failed", audit_id=self.audit_id, turn_index=turn_idx, eval_latency_ms=latency_ms)
                     return
 
                 logger.info(
@@ -558,7 +514,6 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                 )
 
                 if assessment.evidenceFound:
-                    # Grounding check: verify snippet actually aligns with candidate speech
                     is_grounded = check_evidence_grounding(
                         assessment.evidenceSnippet or "",
                         answer_text,
@@ -566,21 +521,15 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                     )
 
                     if not is_grounded:
-                        logger.warning(
-                            "evidence_grounding_failed",
-                            audit_id=self.audit_id,
-                            snippet=assessment.evidenceSnippet,
-                        )
+                        logger.warning("evidence_grounding_failed", audit_id=self.audit_id, snippet=assessment.evidenceSnippet)
                         return
 
-                    # Provenance extraction: extract authentic original turns and text
                     raw_provenance_snippet, source_turns = extract_evidence_provenance(
                         assessment.evidenceSnippet or "",
                         answer_text,
                         conversation_history,
                     )
 
-                    # Spawn tracked persistence task with grace period on shutdown
                     persist_task = asyncio.create_task(
                         notify_careervoice_signal(
                             audit_id=self.audit_id,
@@ -604,22 +553,9 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
                         )
             except Exception as e:
                 latency_ms = round((time.time() - start_eval) * 1000, 2)
-                logger.warning(
-                    "evidence_evaluation_error",
-                    audit_id=self.audit_id,
-                    error=str(e),
-                    eval_latency_ms=latency_ms,
-                )
+                logger.warning("evidence_evaluation_error", audit_id=self.audit_id, error=str(e), eval_latency_ms=latency_ms)
 
     async def shutdown(self, persistence_grace_seconds: float = 2.5):
-        """
-        Graceful session shutdown:
-        1. Immediately cancels active evaluation tasks and properly awaits their termination.
-        2. Waits up to persistence_grace_seconds for pending persistence webhook tasks.
-        3. Cancels and awaits any remaining persistence tasks exceeding timeout.
-        4. Cleans up all tracked task sets so zero orphan tasks remain.
-        """
-        # 1. Cancel evaluation tasks immediately and await them
         eval_tasks = list(self._evaluation_tasks)
         for task in eval_tasks:
             if not task.done():
@@ -628,17 +564,12 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
             await asyncio.gather(*eval_tasks, return_exceptions=True)
         self._evaluation_tasks.clear()
 
-        # 2. Wait for persistence tasks to complete within grace period
         if self._persistence_tasks:
             pending = list(self._persistence_tasks)
             try:
                 done, unfinished = await asyncio.wait(pending, timeout=persistence_grace_seconds)
                 if unfinished:
-                    logger.warning(
-                        "evidence_persistence_shutdown_timeout",
-                        count=len(unfinished),
-                        audit_id=self.audit_id,
-                    )
+                    logger.warning("evidence_persistence_shutdown_timeout", count=len(unfinished), audit_id=self.audit_id)
                     for t in unfinished:
                         if not t.done():
                             t.cancel()
@@ -649,17 +580,9 @@ class CareerVoiceEvidenceEvaluator(FrameProcessor):
 
 
 # ==============================================================================
-# LLM Service Factory
+# LLM Service Factory with Multi-Tier Fallback
 # ==============================================================================
 def create_llm_service(provider_preference: Optional[str] = None):
-    """
-    Instantiates the configured LLM provider service based on availability and preference.
-    Order of selection:
-    1. OpenRouter (OPENROUTER_API_KEY, default model: OPENROUTER_LLM_MODEL or 'openai/gpt-4o-mini')
-    2. Google Gemini (GEMINI_API_KEY, model: GEMINI_MODEL or 'gemini-3.6-flash')
-    3. Anthropic Claude 3.5 Sonnet
-    4. OpenAI GPT-4o-mini
-    """
     openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
     openrouter_model = os.getenv("OPENROUTER_LLM_MODEL", "openai/gpt-4o-mini").strip()
     gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
@@ -717,16 +640,9 @@ def create_llm_service(provider_preference: Optional[str] = None):
 # TTS Service Factory with Multi-Tier Fallback
 # ==============================================================================
 def create_tts_service(provider_preference: Optional[str] = None):
-    """
-    Instantiates the configured TTS provider chain with automatic fallback.
-    Supported providers:
-    1. OpenRouter TTS (OPENROUTER_API_KEY)
-    2. Cartesia Sonic (CARTESIA_API_KEY)
-    3. Novita AI / Fish Audio S1 (NOVITA_API_KEY / FISH_AUDIO_API_KEY)
-    """
     openrouter_key = os.getenv("OPENROUTER_API_KEY", "").strip()
-    openrouter_model = os.getenv("OPENROUTER_TTS_MODEL", "openai/gpt-4o-mini-tts-2025-12-15").strip()
-    openrouter_voice = os.getenv("OPENROUTER_TTS_VOICE", "alloy").strip()
+    openrouter_model = os.getenv("OPENROUTER_TTS_MODEL", "fish-audio/s2.1-pro").strip()
+    openrouter_voice = os.getenv("OPENROUTER_TTS_VOICE", "").strip() or None
     cartesia_key = os.getenv("CARTESIA_API_KEY", "").strip()
     novita_key = os.getenv("NOVITA_API_KEY", "").strip() or os.getenv("FISH_AUDIO_API_KEY", "").strip()
     novita_ref_id = os.getenv("FISH_AUDIO_REFERENCE_ID", "").strip() or None
@@ -741,7 +657,7 @@ def create_tts_service(provider_preference: Optional[str] = None):
                 model=openrouter_model,
                 voice=openrouter_voice,
                 response_format="pcm",
-                sample_rate=24000,
+                sample_rate=44100,
             )
         )
 
@@ -780,10 +696,6 @@ def create_tts_service(provider_preference: Optional[str] = None):
 # Voice Agent Pipeline Runner
 # ==============================================================================
 async def run_careervoice_agent(session_config: VoiceSessionConfig):
-    """
-    Executes a real-time conversational CareerVoice audit session using the specified transport (Daily or LiveKit).
-    The pipeline logic (VAD -> STT -> Evidence Evaluator -> LLM -> TTS -> WebRTC) is provider-agnostic.
-    """
     start_time = time.time()
     audit_id = session_config.audit_id
     provider_name = session_config.provider
@@ -801,7 +713,6 @@ async def run_careervoice_agent(session_config: VoiceSessionConfig):
     evidence_evaluator = None
 
     try:
-        # Resolve transport provider from abstraction factory
         provider = router.get_provider(provider_name)
         transport = provider.create_pipecat_transport(session_config)
 
@@ -812,10 +723,8 @@ async def run_careervoice_agent(session_config: VoiceSessionConfig):
             room_name=session_config.room_name,
         )
 
-        # STT & TTS Providers
         stt = DeepgramSTTService(api_key=DEEPGRAM_API_KEY)
         tts = create_tts_service()
-
         llm = create_llm_service()
 
         system_instruction = f"""You are Qalam, Pathwisse CareerVoice's lead AI Career Auditor and Mentor.
@@ -846,7 +755,6 @@ Rules:
             student_name=student_name,
         )
 
-        # Provider-independent pipeline with non-blocking evidence evaluator
         pipeline = Pipeline(
             [
                 transport.input(),
@@ -898,25 +806,24 @@ Rules:
 
 if __name__ == "__main__":
     if len(sys.argv) < 5:
-        print("Usage: python bot.py <provider: daily|livekit> <room_url> <token> <audit_id> <target_role> [student_name] [room_name]")
+        print("Usage: python bot.py <audit_id> <target_role> <student_name> <provider> [room_url] [token]")
         sys.exit(1)
 
-    prov = sys.argv[1]
-    r_url = sys.argv[2]
-    tkn = sys.argv[3]
-    aud_id = sys.argv[4]
-    role = sys.argv[5] if len(sys.argv) > 5 else "Software Engineer"
-    name = sys.argv[6] if len(sys.argv) > 6 else "Candidate"
-    r_name = sys.argv[7] if len(sys.argv) > 7 else f"careervoice-{aud_id}"
+    _audit_id = sys.argv[1]
+    _target_role = sys.argv[2]
+    _student_name = sys.argv[3]
+    _provider = sys.argv[4]
+    _room_url = sys.argv[5] if len(sys.argv) > 5 else ""
+    _token = sys.argv[6] if len(sys.argv) > 6 else ""
 
-    cfg = VoiceSessionConfig(
-        audit_id=aud_id,
-        target_role=role,
-        student_name=name,
-        provider=prov,
-        room_url=r_url,
-        room_name=r_name,
-        token=tkn,
+    config = VoiceSessionConfig(
+        audit_id=_audit_id,
+        target_role=_target_role,
+        student_name=_student_name,
+        provider=_provider,
+        room_url=_room_url,
+        token=_token,
+        connection_url=_room_url,
     )
 
-    asyncio.run(run_careervoice_agent(cfg))
+    asyncio.run(run_careervoice_agent(config))

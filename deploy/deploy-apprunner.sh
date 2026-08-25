@@ -119,6 +119,10 @@ OPENROUTER_ARN=$(resolve_secret_arn "careervoice/openrouter-api-key")
 DEEPGRAM_ARN=$(resolve_secret_arn "careervoice/deepgram-api-key")
 CARTESIA_ARN=$(resolve_secret_arn "careervoice/cartesia-api-key")
 NOVITA_ARN=$(resolve_secret_arn "careervoice/novita-api-key")
+if [ -z "$NOVITA_ARN" ]; then
+  NOVITA_ARN=$(resolve_secret_arn "careervoice/fish-audio-api-key")
+fi
+FISH_REF_ID_ARN=$(resolve_secret_arn "careervoice/fish-audio-reference-id")
 GEMINI_ARN=$(resolve_secret_arn "careervoice/gemini-api-key")
 
 DAILY_ARN=$(resolve_secret_arn "careervoice/daily-api-key")
@@ -152,10 +156,14 @@ HAS_DAILY=0
 if [ -n "$DAILY_ARN" ]; then HAS_DAILY=1; fi
 
 HAS_LIVEKIT=0
-if [ -n "$LIVEKIT_URL_ARN" ] && [ -n "$LIVEKIT_KEY_ARN" ] && [ -n "$LIVEKIT_SECRET_ARN" ]; then HAS_LIVEKIT=1; fi
+if [ -n "$LIVEKIT_URL_ARN" ] && [ -n "$LIVEKIT_KEY_ARN" ] && [ -n "$LIVEKIT_SECRET_ARN" ]; then
+  HAS_LIVEKIT=1
+elif [ -n "$LIVEKIT_URL_ARN" ] || [ -n "$LIVEKIT_KEY_ARN" ] || [ -n "$LIVEKIT_SECRET_ARN" ]; then
+  echo "WARNING: Partial LiveKit configuration detected. LiveKit transport disabled."
+fi
 
 if [ "$HAS_DAILY" -eq 0 ] && [ "$HAS_LIVEKIT" -eq 0 ]; then
-  echo "ERROR: At least one transport (Daily or LiveKit) must have all required secrets configured."
+  echo "ERROR: At least one transport (Daily or fully configured LiveKit) must have all required secrets configured."
   MISSING_REQUIRED=1
 fi
 
@@ -171,9 +179,10 @@ if [ -n "$OPENROUTER_ARN" ]; then SECRETS_LIST+=("\"OPENROUTER_API_KEY\": \"$OPE
 if [ -n "$DEEPGRAM_ARN" ]; then SECRETS_LIST+=("\"DEEPGRAM_API_KEY\": \"$DEEPGRAM_ARN\""); fi
 if [ -n "$CARTESIA_ARN" ]; then SECRETS_LIST+=("\"CARTESIA_API_KEY\": \"$CARTESIA_ARN\""); fi
 if [ -n "$NOVITA_ARN" ]; then SECRETS_LIST+=("\"NOVITA_API_KEY\": \"$NOVITA_ARN\""); fi
+if [ -n "$FISH_REF_ID_ARN" ]; then SECRETS_LIST+=("\"FISH_AUDIO_REFERENCE_ID\": \"$FISH_REF_ID_ARN\""); fi
 if [ -n "$GEMINI_ARN" ]; then SECRETS_LIST+=("\"GEMINI_API_KEY\": \"$GEMINI_ARN\""); fi
 if [ -n "$DAILY_ARN" ]; then SECRETS_LIST+=("\"DAILY_API_KEY\": \"$DAILY_ARN\""); fi
-if [ -n "$LIVEKIT_URL_ARN" ]; then
+if [ "$HAS_LIVEKIT" -eq 1 ]; then
   SECRETS_LIST+=("\"LIVEKIT_URL\": \"$LIVEKIT_URL_ARN\"")
   SECRETS_LIST+=("\"LIVEKIT_API_KEY\": \"$LIVEKIT_KEY_ARN\"")
   SECRETS_LIST+=("\"LIVEKIT_API_SECRET\": \"$LIVEKIT_SECRET_ARN\"")

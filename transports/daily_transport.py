@@ -1,6 +1,6 @@
 import os
 import time
-from typing import Any, Tuple
+from typing import Any, Tuple, Optional
 import aiohttp
 from loguru import logger
 
@@ -24,26 +24,31 @@ def get_daily_transport_classes():
 
 
 class DailyVoiceTransportProvider(VoiceTransportProvider):
-    """Daily.co WebRTC Transport Provider implementation."""
+    """Daily.co WebRTC Transport Provider implementation with dynamic credential evaluation."""
 
     def __init__(self, api_key: str = "", api_url: str = DAILY_API_URL):
-        self._api_key = api_key or os.getenv("DAILY_API_KEY", "").strip()
+        self._explicit_api_key = api_key
         self._api_url = api_url.rstrip("/")
+
+    @property
+    def api_key(self) -> str:
+        return self._explicit_api_key if self._explicit_api_key else os.getenv("DAILY_API_KEY", "").strip()
 
     @property
     def name(self) -> str:
         return "daily"
 
     def is_configured(self) -> bool:
-        return bool(self._api_key)
+        return bool(self.api_key)
 
     async def _create_daily_room(self, session_name: str) -> Tuple[str, str]:
         """Creates a temporary WebRTC room with 1-hour expiry using Unix epoch timestamp."""
+        key = self.api_key
         headers = {
-            "Authorization": f"Bearer {self._api_key}",
+            "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         }
-        # Fixed: Use standard Unix epoch timestamp for room expiration
+        # Standard Unix epoch timestamp for room expiration
         exp_timestamp = int(time.time()) + 3600
 
         async with aiohttp.ClientSession() as http_session:
@@ -67,8 +72,9 @@ class DailyVoiceTransportProvider(VoiceTransportProvider):
 
     async def _create_meeting_token(self, room_name: str, is_owner: bool, user_name: str) -> str:
         """Generates a scoped meeting token for a participant."""
+        key = self.api_key
         headers = {
-            "Authorization": f"Bearer {self._api_key}",
+            "Authorization": f"Bearer {key}",
             "Content-Type": "application/json",
         }
         exp_timestamp = int(time.time()) + 3600

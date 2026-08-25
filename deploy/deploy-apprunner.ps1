@@ -88,6 +88,8 @@ $OpenRouterArn = Resolve-SecretArn "careervoice/openrouter-api-key"
 $DeepgramArn = Resolve-SecretArn "careervoice/deepgram-api-key"
 $CartesiaArn = Resolve-SecretArn "careervoice/cartesia-api-key"
 $NovitaArn = Resolve-SecretArn "careervoice/novita-api-key"
+if (-not $NovitaArn) { $NovitaArn = Resolve-SecretArn "careervoice/fish-audio-api-key" }
+$FishRefIdArn = Resolve-SecretArn "careervoice/fish-audio-reference-id"
 $GeminiArn = Resolve-SecretArn "careervoice/gemini-api-key"
 
 $DailyArn = Resolve-SecretArn "careervoice/daily-api-key"
@@ -122,9 +124,14 @@ if (-not $OpenRouterArn -and -not $GeminiArn -and -not $AnthropicArn -and -not $
 
 $HasDaily = [bool]$DailyArn
 $HasLiveKit = [bool]($LiveKitUrlArn -and $LiveKitKeyArn -and $LiveKitSecretArn)
+$HasPartialLiveKit = [bool]($LiveKitUrlArn -or $LiveKitKeyArn -or $LiveKitSecretArn) -and -not $HasLiveKit
+
+if ($HasPartialLiveKit) {
+  Write-Warning "WARNING: Partial LiveKit configuration detected. LiveKit transport disabled."
+}
 
 if (-not $HasDaily -and -not $HasLiveKit) {
-  Write-Error "At least one transport (Daily or LiveKit) must have all required secrets configured."
+  Write-Error "At least one transport (Daily or fully configured LiveKit) must have all required secrets configured."
   $MissingRequired = $true
 }
 
@@ -140,9 +147,10 @@ if ($OpenRouterArn) { $SecretsList += "`"OPENROUTER_API_KEY`": `"$OpenRouterArn`
 if ($DeepgramArn) { $SecretsList += "`"DEEPGRAM_API_KEY`": `"$DeepgramArn`"" }
 if ($CartesiaArn) { $SecretsList += "`"CARTESIA_API_KEY`": `"$CartesiaArn`"" }
 if ($NovitaArn) { $SecretsList += "`"NOVITA_API_KEY`": `"$NovitaArn`"" }
+if ($FishRefIdArn) { $SecretsList += "`"FISH_AUDIO_REFERENCE_ID`": `"$FishRefIdArn`"" }
 if ($GeminiArn) { $SecretsList += "`"GEMINI_API_KEY`": `"$GeminiArn`"" }
 if ($DailyArn) { $SecretsList += "`"DAILY_API_KEY`": `"$DailyArn`"" }
-if ($LiveKitUrlArn) {
+if ($HasLiveKit) {
   $SecretsList += "`"LIVEKIT_URL`": `"$LiveKitUrlArn`""
   $SecretsList += "`"LIVEKIT_API_KEY`": `"$LiveKitKeyArn`""
   $SecretsList += "`"LIVEKIT_API_SECRET`": `"$LiveKitSecretArn`""

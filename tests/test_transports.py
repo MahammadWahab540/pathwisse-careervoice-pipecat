@@ -3,6 +3,7 @@ import pytest
 import asyncio
 from unittest.mock import patch, MagicMock, AsyncMock
 from fastapi.testclient import TestClient
+from pipecat.frames.frames import LLMMessagesFrame
 
 from transports.base import (
     sanitize_identifier,
@@ -15,7 +16,7 @@ from transports.livekit_transport import (
     generate_livekit_token,
 )
 from transports.factory import TransportRouter
-from bot import create_llm_service, notify_careervoice_signal
+from bot import create_llm_service, notify_careervoice_signal, CareerVoiceEvidenceEvaluator
 from server import app
 
 client = TestClient(app)
@@ -188,6 +189,40 @@ async def test_router_both_fail_raises_runtime_error():
         await router.provision_session_with_failover("a4", "Cybersecurity", requested_transport=None)
 
 
+def test_router_dynamic_daily_configured_from_env():
+    """Transport router dynamically detects Daily credentials from environment without restarting."""
+    from transports.factory import router
+    with patch.dict(os.environ, {"DAILY_API_KEY": "test-env-daily-key"}, clear=True):
+        assert router.get_provider("daily").is_configured() is True
+        readiness = router.get_readiness_status()
+        assert readiness["daily"]["configured"] is True
+
+
+def test_router_dynamic_livekit_configured_from_env():
+    """Transport router dynamically detects complete LiveKit credentials from environment."""
+    from transports.factory import router
+    livekit_env = {
+        "LIVEKIT_URL": "wss://test.livekit.cloud",
+        "LIVEKIT_API_KEY": "test-key",
+        "LIVEKIT_API_SECRET": "test-secret",
+    }
+    with patch.dict(os.environ, livekit_env, clear=True):
+        assert router.get_provider("livekit").is_configured() is True
+        readiness = router.get_readiness_status()
+        assert readiness["livekit"]["configured"] is True
+
+
+def test_router_dynamic_env_mutation_updates_configured_state():
+    """Mutating environment variables at runtime updates provider configured state immediately."""
+    from transports.factory import router
+    with patch.dict(os.environ, {}, clear=True):
+        assert router.get_provider("daily").is_configured() is False
+        assert router.get_provider("livekit").is_configured() is False
+
+    with patch.dict(os.environ, {"DAILY_API_KEY": "dynamic-key"}):
+        assert router.get_provider("daily").is_configured() is True
+
+
 # ==============================================================================
 # 6. Service Token Authentication & Production Fail-Closed Tests
 # ==============================================================================
@@ -290,7 +325,7 @@ def test_backward_compatibility_pre_provisioned_room():
 
 
 # ==============================================================================
-# 8. Readiness Semantics Tests (200 vs 503)
+# 8. Readiness Semantics & Transport Combinations Tests
 # ==============================================================================
 def test_readiness_not_ready_returns_503():
     with patch.dict(os.environ, {}, clear=True):
@@ -301,7 +336,7 @@ def test_readiness_not_ready_returns_503():
         assert data["providers"]["deepgram"] is False
 
 
-def test_readiness_ready_returns_200():
+def test_readiness_daily_only_configured_returns_200():
     ready_env = {
         "APP_ENV": "production",
         "CAREERVOICE_SERVICE_TOKEN": "secret-service-token",
@@ -311,21 +346,84 @@ def test_readiness_ready_returns_200():
         "GEMINI_API_KEY": "gemini-key-123",
     }
     with patch.dict(os.environ, ready_env):
-        with patch.object(
-            DailyVoiceTransportProvider, "is_configured", return_value=True
-        ):
-            response = client.get("/ready")
-            assert response.status_code == 200
-            data = response.json()
-            assert data["status"] == "ready"
-            assert data["providers"]["deepgram"] is True
-            assert data["providers"]["cartesia"] is True
-            assert data["providers"]["llm"] is True
-            assert data["providers"]["serviceAuth"] is True
+        with patch.object(DailyVoiceTransportProvider, "is_configured", return_value=True):
+            with patch.object(LiveKitVoiceTransportProvider, "is_configured", return_value=False):
+                response = client.get("/ready")
+                assert response.status_code == 200
+                data = response.json()
+                assert data["status"] == "ready"
+                assert data["transports"]["daily"]["configured"] is True
+                assert data["transports"]["livekit"]["configured"] is False
+
+
+def test_readiness_livekit_only_fully_configured_returns_200():
+    ready_env = {
+        "APP_ENV": "production",
+        "CAREERVOICE_SERVICE_TOKEN": "secret-service-token",
+        "LIVEKIT_URL": "wss://careervoice.livekit.cloud",
+        "LIVEKIT_API_KEY": "livekit-key",
+        "LIVEKIT_API_SECRET": "livekit-secret",
+        "DEEPGRAM_API_KEY": "deepgram-key",
+        "CARTESIA_API_KEY": "cartesia-key",
+        "GEMINI_API_KEY": "gemini-key",
+    }
+    with patch.dict(os.environ, ready_env):
+        with patch.object(DailyVoiceTransportProvider, "is_configured", return_value=False):
+            with patch.object(LiveKitVoiceTransportProvider, "is_configured", return_value=True):
+                response = client.get("/ready")
+                assert response.status_code == 200
+                data = response.json()
+                assert data["status"] == "ready"
+                assert data["transports"]["daily"]["configured"] is False
+                assert data["transports"]["livekit"]["configured"] is True
+
+
+def test_readiness_partial_livekit_with_daily_daily_works_livekit_disabled():
+    ready_env = {
+        "APP_ENV": "production",
+        "CAREERVOICE_SERVICE_TOKEN": "secret-service-token",
+        "DAILY_API_KEY": "daily-key-123",
+        "LIVEKIT_URL": "wss://careervoice.livekit.cloud",
+        "LIVEKIT_API_KEY": "",  # Incomplete LiveKit
+        "LIVEKIT_API_SECRET": "",
+        "DEEPGRAM_API_KEY": "deepgram-key",
+        "CARTESIA_API_KEY": "cartesia-key",
+        "GEMINI_API_KEY": "gemini-key",
+    }
+    with patch.dict(os.environ, ready_env):
+        with patch.object(DailyVoiceTransportProvider, "is_configured", return_value=True):
+            with patch.object(LiveKitVoiceTransportProvider, "is_configured", return_value=False):
+                response = client.get("/ready")
+                assert response.status_code == 200
+                data = response.json()
+                assert data["status"] == "ready"
+                assert data["transports"]["daily"]["configured"] is True
+                assert data["transports"]["livekit"]["configured"] is False
+
+
+def test_readiness_partial_livekit_without_daily_returns_503():
+    ready_env = {
+        "APP_ENV": "production",
+        "CAREERVOICE_SERVICE_TOKEN": "secret-service-token",
+        "DAILY_API_KEY": "",  # No Daily
+        "LIVEKIT_URL": "wss://careervoice.livekit.cloud",
+        "LIVEKIT_API_KEY": "",  # Incomplete LiveKit
+        "LIVEKIT_API_SECRET": "",
+        "DEEPGRAM_API_KEY": "deepgram-key",
+        "CARTESIA_API_KEY": "cartesia-key",
+        "GEMINI_API_KEY": "gemini-key",
+    }
+    with patch.dict(os.environ, ready_env):
+        with patch.object(DailyVoiceTransportProvider, "is_configured", return_value=False):
+            with patch.object(LiveKitVoiceTransportProvider, "is_configured", return_value=False):
+                response = client.get("/ready")
+                assert response.status_code == 503
+                data = response.json()
+                assert data["status"] == "not_ready"
 
 
 # ==============================================================================
-# 9. Evidence Persistence Callback Tests
+# 9. Evidence Persistence Callback & Pipeline Evaluator Tests
 # ==============================================================================
 @pytest.mark.asyncio
 async def test_notify_careervoice_signal_execution():
@@ -348,3 +446,48 @@ async def test_notify_careervoice_signal_execution():
         assert "/api/audit/evidence/signal" in call_args[0][0]
         assert call_args[1]["json"]["auditId"] == "audit-evidence-01"
         assert call_args[1]["json"]["skillName"] == "React State Management"
+
+
+@pytest.mark.asyncio
+async def test_career_voice_evidence_evaluator_triggers_signal_on_pipeline_frame():
+    evaluator = CareerVoiceEvidenceEvaluator(
+        audit_id="audit-pipeline-test-01",
+        target_role="Full Stack Engineer",
+        student_name="Candidate",
+    )
+
+    from bot import EvidenceAssessment
+    assessment = EvidenceAssessment(
+        skillName="React",
+        evidenceFound=True,
+        extractedLevel="Advanced",
+        confidenceScore=88,
+        evidenceStrength="strong",
+        evidenceSnippet="real-time analytics dashboard with React, Node.js, and PostgreSQL",
+        requiresFollowUp=False,
+    )
+
+    with patch("bot.evaluate_student_evidence_llm", new_callable=AsyncMock, return_value=assessment):
+        with patch("bot.notify_careervoice_signal", new_callable=AsyncMock) as mock_signal:
+            from pipecat.processors.frame_processor import FrameDirection
+            frame = LLMMessagesFrame(
+                messages=[
+                    {"role": "assistant", "content": "What did you build recently?"},
+                    {
+                        "role": "user",
+                        "content": "I built a real-time analytics dashboard with React, Node.js, and PostgreSQL using Docker microservices.",
+                    },
+                ]
+            )
+
+            await evaluator.process_frame(frame, FrameDirection.DOWNSTREAM)
+            await asyncio.sleep(0.05)  # Allow async background task to schedule
+
+            mock_signal.assert_called_once()
+            call_kwargs = mock_signal.call_args[1]
+            assert call_kwargs["audit_id"] == "audit-pipeline-test-01"
+            assert call_kwargs["skill_name"] == "React"
+            assert call_kwargs["evidence_strength"] == "strong"
+            assert call_kwargs["extracted_level"] == "Advanced"
+            assert call_kwargs["confidence_score"] == 88
+            await evaluator.shutdown()

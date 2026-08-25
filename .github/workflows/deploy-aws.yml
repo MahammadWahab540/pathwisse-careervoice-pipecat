@@ -1,50 +1,241 @@
-name: Deploy Pipecat to AWS App Runner
+name: Deploy Pipecat Voice Agent to AWS Production
 
 on:
   push:
     branches:
       - main
+  workflow_dispatch:
 
 permissions:
   id-token: write
   contents: read
 
 jobs:
-  deploy:
-    name: Build & Deploy to AWS App Runner
+  test-and-deploy:
+    name: Build, Test & Deploy to AWS App Runner
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Configure AWS credentials via OIDC Role
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run unit & contract tests
+        run: |
+          pytest -v
+
+      - name: Inspect OIDC Token Claims
+        run: |
+          TOKEN=$(curl -sLS "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=sts.amazonaws.com" -H "User-Agent: actions/runner" -H "Authorization: Bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" | jq -r '.value')
+          echo "=== OIDC JWT CLAIMS ==="
+          echo "$TOKEN" | cut -d. -f2 | base64 -d | jq '{iss, sub, aud, repository, repository_owner, ref, event_name}'
+          echo "=== END CLAIMS ==="
+
+      - name: Configure AWS Credentials via OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
-          aws-region: ${{ secrets.AWS_REGION || 'ap-south-1' }}
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'ap-south-1' }}
           audience: sts.amazonaws.com
+
+      - name: Verify AWS Caller Identity
+        run: |
+          aws sts get-caller-identity
 
       - name: Login to Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Create ECR Repository if not exists
-        run: |
-          aws ecr describe-repositories --repository-names careervoice-pipecat || \
-          aws ecr create-repository --repository-name careervoice-pipecat --image-scanning-configuration scanOnPush=true --encryption-configuration encryptionType=AES256
-
-      - name: Build, tag, and push Docker image to Amazon ECR
+      - name: Build, tag, and push Docker image
+        id: build-image
         env:
           ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: careervoice-pipecat
+          ECR_REPOSITORY: ${{ vars.ECR_REPOSITORY || 'careervoice-pipecat' }}
           IMAGE_TAG: ${{ github.sha }}
         run: |
-          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
-          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "Building Docker container image for SHA: ${IMAGE_TAG}"
+          docker build \
+            -t "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" \
+            -t "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest" .
 
-      - name: Deploy to AWS App Runner
+          echo "Pushing images to Amazon ECR..."
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
+
+          IMAGE_DIGEST=$(aws ecr describe-images \
+            --repository-name "${ECR_REPOSITORY}" \
+            --image-ids imageTag="${IMAGE_TAG}" \
+            --region "${{ vars.AWS_REGION || 'ap-south-1' }}" \
+            --query "imageDetails[0].imageDigest" \
+            --output text)
+
+          echo "Pushed Image URI: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          echo "Image Digest: ${IMAGE_DIGEST}"
+          echo "image_uri=${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "image_digest=${IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy SHA-tagged image to AWS App Runner
+        id: deploy-apprunner
+        env:
+          SERVICE_NAME: careervoice-pipecat
+          AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+          TARGET_IMAGE: ${{ steps.build-image.outputs.image_uri }}
         run: |
-          chmod +x deploy/deploy-apprunner.sh
-          ./deploy/deploy-apprunner.sh
+          echo "Locating existing App Runner service: ${SERVICE_NAME}"
+          SERVICE_ARN=$(aws apprunner list-services \
+            --region "${AWS_REGION}" \
+            --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn | [0]" \
+            --output text)
+
+          if [ -z "${SERVICE_ARN}" ] || [ "${SERVICE_ARN}" == "None" ]; then
+            echo "ERROR: App Runner service ${SERVICE_NAME} was not found in ${AWS_REGION}"
+            exit 1
+          fi
+
+          echo "Discovered Service ARN: ${SERVICE_ARN}"
+          
+          # Fetch existing SourceConfiguration to preserve secrets and runtime configs
+          SOURCE_CONFIG=$(aws apprunner describe-service \
+            --service-arn "${SERVICE_ARN}" \
+            --region "${AWS_REGION}" \
+            --query "Service.SourceConfiguration")
+          
+          # Update ImageIdentifier with exact commit SHA image
+          UPDATED_SOURCE_CONFIG=$(echo "${SOURCE_CONFIG}" | jq --arg img "${TARGET_IMAGE}" '.ImageRepository.ImageIdentifier = $img')
+          
+          echo "Updating App Runner service with immutable commit image: ${TARGET_IMAGE}..."
+          aws apprunner update-service \
+            --service-arn "${SERVICE_ARN}" \
+            --region "${AWS_REGION}" \
+            --source-configuration "${UPDATED_SOURCE_CONFIG}"
+
+          echo "service_arn=${SERVICE_ARN}" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for App Runner Deployment & Stability
+        id: wait-deploy
+        env:
+          SERVICE_ARN: ${{ steps.deploy-apprunner.outputs.service_arn }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+        run: |
+          echo "Waiting for App Runner deployment on ${SERVICE_ARN}..."
+          
+          MAX_WAIT=600
+          INTERVAL=15
+          ELAPSED=0
+
+          # Wait briefly for status to change from RUNNING to OPERATION_IN_PROGRESS
+          sleep 10
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            STATUS=$(aws apprunner describe-service \
+              --service-arn "${SERVICE_ARN}" \
+              --region "${AWS_REGION}" \
+              --query "Service.Status" \
+              --output text)
+            
+            OP_STATUS=$(aws apprunner list-operations \
+              --service-arn "${SERVICE_ARN}" \
+              --region "${AWS_REGION}" \
+              --query "OperationSummaryList[0].Status" \
+              --output text)
+
+            echo "Elapsed: ${ELAPSED}s | Service Status: ${STATUS} | Latest Operation: ${OP_STATUS}"
+
+            if [ "${STATUS}" == "RUNNING" ] && [ "${OP_STATUS}" == "SUCCEEDED" ]; then
+              echo "Deployment SUCCEEDED! Service is in RUNNING state."
+              break
+            elif [ "${STATUS}" == "FAILED" ] || [ "${OP_STATUS}" == "FAILED" ] || [ "${OP_STATUS}" == "ROLLBACK_SUCCEEDED" ]; then
+              echo "ERROR: Deployment failed or rolled back. Service Status: ${STATUS}, Operation Status: ${OP_STATUS}"
+              exit 1
+            fi
+
+            sleep $INTERVAL
+            ELAPSED=$((ELAPSED + INTERVAL))
+          done
+
+          if [ $ELAPSED -ge $MAX_WAIT ]; then
+            echo "ERROR: Deployment timed out after ${MAX_WAIT} seconds."
+            exit 1
+          fi
+
+          SERVICE_URL=$(aws apprunner describe-service \
+            --service-arn "${SERVICE_ARN}" \
+            --region "${AWS_REGION}" \
+            --query "Service.ServiceUrl" \
+            --output text)
+
+          echo "Live Service Endpoint: https://${SERVICE_URL}"
+          echo "service_url=https://${SERVICE_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Production Endpoints (/health & /ready)
+        env:
+          ENDPOINT: ${{ steps.wait-deploy.outputs.service_url }}
+        run: |
+          echo "Testing Production Health Endpoint: ${ENDPOINT}/health"
+          HEALTH_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${ENDPOINT}/health")
+          echo "HTTP Response: ${HEALTH_STATUS}"
+          if [ "${HEALTH_STATUS}" != "200" ]; then
+            echo "ERROR: /health returned HTTP ${HEALTH_STATUS} instead of 200"
+            exit 1
+          fi
+
+          echo "Testing Production Readiness Endpoint: ${ENDPOINT}/ready"
+          READY_STATUS=$(curl -s -o /dev/null -w "%{http_code}" "${ENDPOINT}/ready")
+          echo "HTTP Response: ${READY_STATUS}"
+          if [ "${READY_STATUS}" != "200" ]; then
+            echo "ERROR: /ready returned HTTP ${READY_STATUS} instead of 200"
+            exit 1
+          fi
+
+          READY_BODY=$(curl -s "${ENDPOINT}/ready")
+          echo "Readiness Body: ${READY_BODY}"
+
+      - name: Audit Runtime Environment & Secret Presence (Zero Leakage)
+        env:
+          SERVICE_ARN: ${{ steps.deploy-apprunner.outputs.service_arn }}
+          AWS_REGION: ${{ vars.AWS_REGION || 'ap-south-1' }}
+        run: |
+          echo "=== RUNTIME CONFIGURATION AUDIT (Presence Check Only) ==="
+          SECRETS_KEYS=$(aws apprunner describe-service \
+            --service-arn "${SERVICE_ARN}" \
+            --region "${AWS_REGION}" \
+            --query "Service.SourceConfiguration.ImageRepository.ImageConfiguration.RuntimeEnvironmentSecrets | keys(@)" \
+            --output text)
+          
+          VARS_KEYS=$(aws apprunner describe-service \
+            --service-arn "${SERVICE_ARN}" \
+            --region "${AWS_REGION}" \
+            --query "Service.SourceConfiguration.ImageRepository.ImageConfiguration.RuntimeEnvironmentVariables | keys(@)" \
+            --output text)
+
+          check_present() {
+            local name=$1
+            if echo "${SECRETS_KEYS} ${VARS_KEYS}" | grep -qw "$name"; then
+              echo "  [CONFIGURED] ${name}: PRESENT"
+            else
+              echo "  [OPTIONAL/UNSET] ${name}: NOT IN RUNTIME CONFIG"
+            fi
+          }
+
+          check_present "CAREERVOICE_API_URL"
+          check_present "CAREERVOICE_SERVICE_TOKEN"
+          check_present "GEMINI_API_KEY"
+          check_present "OPENAI_API_KEY"
+          check_present "DEEPGRAM_API_KEY"
+          check_present "NOVITA_API_KEY"
+          check_present "CARTESIA_API_KEY"
+          check_present "DAILY_API_KEY"
+          echo "=== AUDIT COMPLETE ==="
